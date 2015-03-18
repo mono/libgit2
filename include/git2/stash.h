@@ -93,7 +93,7 @@ typedef enum {
  * in the stash will be left around in the workdir.
  *
  * If passing the GIT_APPLY_REINSTATE_INDEX flag and there would be conflicts
- * when reinstating the index, the function will return GIT_EUNMERGED and both
+ * when reinstating the index, the function will return GIT_EMERGECONFLICT and both
  * the workdir and index will be left untouched.
  *
  * @param repo The owning repository.
