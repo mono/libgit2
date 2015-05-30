@@ -43,6 +43,8 @@ typedef enum {
 	/** Restrict the search of commits to those reachable following only the
 	 * first parents. */
 	GIT_BLAME_FIRST_PARENT = (1<<4),
+	/** Take less time to generate blame by only following exact matches */
+	GIT_BLAME_FOLLOW_EXACT_RENAMES = (1<<5),
 } git_blame_flag_t;
 
 /**
