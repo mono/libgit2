@@ -436,12 +436,14 @@ static git_blame__origin* find_origin(
 		if (0 != git_diff_tree_to_tree(&difflist, blame->repository, ptree, otree, &diffopts))
 			goto cleanup;
 
-		/* Let diff find renames based on blame options */
-		findopts.flags = blame->options.flags & GIT_BLAME_FOLLOW_EXACT_RENAMES ?
-			GIT_DIFF_FIND_EXACT_MATCH_ONLY : GIT_DIFF_FIND_RENAMES;
+		if (!(blame->options.flags & GIT_BLAME_DONT_FOLLOW_RENAMES)) {
+			/* Let diff find renames based on blame options */
+			findopts.flags = blame->options.flags & GIT_BLAME_FOLLOW_EXACT_RENAMES ?
+				GIT_DIFF_FIND_EXACT_MATCH_ONLY : GIT_DIFF_FIND_RENAMES;
 
-		if (0 != git_diff_find_similar(difflist, &findopts))
-			goto cleanup;
+			if (0 != git_diff_find_similar(difflist, &findopts))
+				goto cleanup;
+		}
 
 		/* Find one that matches */
 		for (i=0; i<(int)git_diff_num_deltas(difflist); i++) {

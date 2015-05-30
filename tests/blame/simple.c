@@ -355,3 +355,19 @@ void test_blame_simple__can_follow_only_exact_renames(void)
 	cl_assert_equal_i(1, git_blame_get_hunk_count(g_blame));
 	check_blame_hunk_index(g_repo, g_blame, 0,  1, 10, 0, "fa2ae14c", "d_similar.txt");
 }
+
+void test_blame_simple__does_not_follow_renames(void)
+{
+	git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
+	opts.flags |= GIT_BLAME_DONT_FOLLOW_RENAMES;
+
+	cl_git_pass(git_repository_open(&g_repo, cl_fixture("blametest.git")));
+
+	cl_git_pass(git_blame_file(&g_blame, g_repo, "c_exact.txt", &opts));
+	cl_assert_equal_i(1, git_blame_get_hunk_count(g_blame));
+	check_blame_hunk_index(g_repo, g_blame, 0,  1, 10, 0, "dc0ba436", "c_exact.txt");
+
+	cl_git_pass(git_blame_file(&g_blame, g_repo, "d_similar.txt", &opts));
+	cl_assert_equal_i(1, git_blame_get_hunk_count(g_blame));
+	check_blame_hunk_index(g_repo, g_blame, 0,  1, 10, 0, "fa2ae14c", "d_similar.txt");
+}
