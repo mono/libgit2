@@ -9,6 +9,7 @@
 #define INCLUDE_git_blame_h__
 
 #include "common.h"
+#include "diff.h"
 #include "oid.h"
 
 /**
@@ -55,10 +56,14 @@ typedef enum {
  * Initialize with `GIT_BLAME_OPTIONS_INIT`. Alternatively, you can
  * use `git_blame_init_options`.
  *
+ *- `find_options` specifies what strategies should be used for
+ *               rename detection. The default is rename with threshold
+ *               heuristics.
  */
 typedef struct git_blame_options {
 	unsigned int version;
 
+	git_diff_find_options find_options;
 	/** A combination of `git_blame_flag_t` */
 	uint32_t flags;
 	/** The lower bound on the number of alphanumeric
@@ -87,8 +92,12 @@ typedef struct git_blame_options {
 	size_t max_line;
 } git_blame_options;
 
+#define GIT_BLAME_DIFF_FIND_OPTIONS_INIT {GIT_DIFF_FIND_OPTIONS_VERSION, \
+	GIT_DIFF_FIND_RENAMES }
+
 #define GIT_BLAME_OPTIONS_VERSION 1
-#define GIT_BLAME_OPTIONS_INIT {GIT_BLAME_OPTIONS_VERSION}
+#define GIT_BLAME_OPTIONS_INIT {GIT_BLAME_OPTIONS_VERSION, \
+	GIT_BLAME_DIFF_FIND_OPTIONS_INIT }
 
 /**
  * Initialize git_blame_options structure
