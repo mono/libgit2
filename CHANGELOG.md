@@ -133,6 +133,12 @@ support for HTTPS connections insead of OpenSSL.
   path. For this, `GIT_CREDTYPE_SSH_MEMORY` and
   `git_cred_ssh_key_memory_new()` have been added.
 
+* `git_blame_options` flags can now be configured to not use similarity
+  heuristics during a blame via GIT_BLAME_FOLLOW_EXACT_RENAMES flag.
+
+* `git_blame_options` flags can now be configured to not follow renames
+  at all during a blame via GIT_BLAME_DONT_FOLLOW_RENAMES flag.
+
 ### API removals
 
 * `git_remote_save()` and `git_remote_clear_refspecs()` have been
