@@ -11,10 +11,6 @@
 #include "net.h"
 #include "types.h"
 
-#ifdef GIT_SSH
-#include <libssh2.h>
-#endif
-
 /**
  * @file git2/transport.h
  * @brief Git transport interfaces and functions
@@ -23,6 +19,39 @@
  * @{
  */
 GIT_BEGIN_DECL
+
+/**
+ * Type of host certificate structure that is passed to the check callback
+ */
+typedef enum {
+        /**
+         * The `data` argument to the callback will be a pointer to
+         * OpenSSL's `X509` structure.
+         */
+	GIT_CERT_X509_OPENSSL,
+	GIT_CERT_X509_WINHTTP,
+        /**
+         * The `data` argument to the callback will be a pointer to a
+         * `git_cert_hostkey` structure.
+         */
+	GIT_CERT_HOSTKEY_LIBSSH2,
+} git_cert_t;
+
+/**
+ * Hostkey information taken from libssh2
+ */
+typedef struct {
+        /**
+         * A hostkey type from libssh2, either
+         * `LIBSSH2_HOSTKEY_HASH_MD5` or `LIBSSH2_HOSTKEY_HASH_SHA1`
+         */
+        int type;
+        /**
+         * Hostkey hash. If the type is MD5, only the first 16 bytes
+         * will be set.
+         */
+        unsigned char hash[20];
+} git_cert_hostkey;
 
 /*
  *** Begin interface for credentials acquisition ***
@@ -61,13 +90,19 @@ typedef struct {
 	char *password;
 } git_cred_userpass_plaintext;
 
-#ifdef GIT_SSH
-typedef LIBSSH2_USERAUTH_PUBLICKEY_SIGN_FUNC((*git_cred_sign_callback));
-typedef LIBSSH2_USERAUTH_KBDINT_RESPONSE_FUNC((*git_cred_ssh_interactive_callback));
-#else
-typedef int (*git_cred_sign_callback)(void *, ...);
-typedef int (*git_cred_ssh_interactive_callback)(void *, ...);
+
+/*
+ * If the user hasn't included libssh2.h before git2.h, we need to
+ * define a few types for the callback signatures.
+ */
+#ifndef LIBSSH2_VERSION
+typedef struct _LIBSSH2_SESSION LIBSSH2_SESSION;
+typedef struct _LIBSSH2_USERAUTH_KBDINT_PROMPT LIBSSH2_USERAUTH_KBDINT_PROMPT;
+typedef struct _LIBSSH2_USERAUTH_KBDINT_RESPONSE LIBSSH2_USERAUTH_KBDINT_RESPONSE;
 #endif
+
+typedef int (*git_cred_sign_callback)(LIBSSH2_SESSION *session, unsigned char **sig, size_t *sig_len, const unsigned char *data, size_t data_len, void **abstract);
+typedef void (*git_cred_ssh_interactive_callback)(const char* name, int name_len, const char* instruction, int instruction_len, int num_prompts, const LIBSSH2_USERAUTH_KBDINT_PROMPT* prompts, LIBSSH2_USERAUTH_KBDINT_RESPONSE* responses, void **abstract);
 
 /**
  * A ssh key from disk
@@ -238,6 +273,7 @@ typedef enum {
 } git_transport_flags_t;
 
 typedef int (*git_transport_message_cb)(const char *str, int len, void *data);
+typedef int (*git_certificate_check_cb)(git_cert_t type, void *data, void *payload);
 
 typedef struct git_transport git_transport;
 
@@ -248,6 +284,7 @@ struct git_transport {
 		git_transport *transport,
 		git_transport_message_cb progress_cb,
 		git_transport_message_cb error_cb,
+		git_certificate_check_cb cert_check_cb,
 		void *payload);
 
 	/* Connect the transport to the remote repository, using the given
@@ -314,14 +351,13 @@ struct git_transport {
  * Initializes a `git_transport` with default values. Equivalent to
  * creating an instance with GIT_TRANSPORT_INIT.
  *
- * @param opts the `git_transport` instance to initialize.
- * @param version the version of the struct; you should pass
- *        `GIT_TRANSPORT_VERSION` here.
+ * @param opts the `git_transport` struct to initialize
+ * @param version Version of struct; pass `GIT_TRANSPORT_VERSION`
  * @return Zero on success; -1 on failure.
  */
 GIT_EXTERN(int) git_transport_init(
-	git_transport* opts,
-	int version);
+	git_transport *opts,
+	unsigned int version);
 
 /**
  * Function to use to create a transport from a URL. The transport database

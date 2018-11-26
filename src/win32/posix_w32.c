@@ -19,6 +19,15 @@
 # define FILE_NAME_NORMALIZED 0
 #endif
 
+/* Options which we always provide to _wopen.
+ *
+ * _O_BINARY - Raw access; no translation of CR or LF characters
+ * _O_NOINHERIT - Do not mark the created handle as inheritable by child processes.
+ *    The Windows default is 'not inheritable', but the CRT's default (following
+ *    POSIX convention) is 'inheritable'. We have no desire for our handles to be
+ *    inheritable on Windows, so specify the flag to get default behavior back. */
+#define STANDARD_OPEN_FLAGS (_O_BINARY | _O_NOINHERIT)
+
 /* GetFinalPathNameByHandleW signature */
 typedef DWORD(WINAPI *PFGetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
 
@@ -317,7 +326,7 @@ int p_open(const char *path, int flags, ...)
 		va_end(arg_list);
 	}
 
-	return _wopen(buf, flags | _O_BINARY, mode);
+	return _wopen(buf, flags | STANDARD_OPEN_FLAGS, mode);
 }
 
 int p_creat(const char *path, mode_t mode)
@@ -327,7 +336,7 @@ int p_creat(const char *path, mode_t mode)
 	if (utf8_to_16_with_errno(buf, path) < 0)
 		return -1;
 
-	return _wopen(buf, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, mode);
+	return _wopen(buf, _O_WRONLY | _O_CREAT | _O_TRUNC | STANDARD_OPEN_FLAGS, mode);
 }
 
 int p_getcwd(char *buffer_out, size_t size)
@@ -569,7 +578,7 @@ int p_mkstemp(char *tmp_path)
 		return -1;
 #endif
 
-	return p_creat(tmp_path, 0744); //-V536
+	return p_open(tmp_path, O_RDWR | O_CREAT | O_EXCL, 0744); //-V536
 }
 
 int p_access(const char* path, mode_t mode)
@@ -580,6 +589,31 @@ int p_access(const char* path, mode_t mode)
 		return -1;
 
 	return _waccess(buf, mode);
+}
+
+static int ensure_writable(wchar_t *fpath)
+{
+	DWORD attrs;
+
+	attrs = GetFileAttributesW(fpath);
+	if (attrs == INVALID_FILE_ATTRIBUTES) {
+		if (GetLastError() == ERROR_FILE_NOT_FOUND)
+			return 0;
+
+		giterr_set(GITERR_OS, "failed to get attributes");
+		return -1;
+	}
+
+	if (!(attrs & FILE_ATTRIBUTE_READONLY))
+		return 0;
+
+	attrs &= ~FILE_ATTRIBUTE_READONLY;
+	if (!SetFileAttributesW(fpath, attrs)) {
+		giterr_set(GITERR_OS, "failed to set attributes");
+		return -1;
+	}
+
+	return 0;
 }
 
 int p_rename(const char *from, const char *to)
@@ -593,12 +627,13 @@ int p_rename(const char *from, const char *to)
 	if (utf8_to_16_with_errno(wfrom, from) < 0 ||
 		utf8_to_16_with_errno(wto, to) < 0)
 		return -1;
-	
+
 	/* wait up to 50ms if file is locked by another thread or process */
 	rename_tries = 0;
 	rename_succeeded = 0;
 	while (rename_tries < 10) {
-		if (MoveFileExW(wfrom, wto, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0) {
+		if (ensure_writable(wto) == 0 &&
+		    MoveFileExW(wfrom, wto, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0) {
 			rename_succeeded = 1;
 			break;
 		}

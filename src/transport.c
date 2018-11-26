@@ -133,9 +133,10 @@ int git_transport_new(git_transport **out, git_remote *owner, const char *url)
 		return -1;
 	}
 
-	error = fn(&transport, owner, param);
-	if (error < 0)
+	if ((error = fn(&transport, owner, param)) < 0)
 		return error;
+
+	GITERR_CHECK_VERSION(transport, GIT_TRANSPORT_VERSION, "git_transport");
 
 	*out = transport;
 
@@ -218,14 +219,9 @@ int git_remote_supported_url(const char* url)
 	return fn != &git_transport_dummy;
 }
 
-int git_transport_init(git_transport* opts, int version)
+int git_transport_init(git_transport *opts, unsigned int version)
 {
-	if (version != GIT_TRANSPORT_VERSION) {
-		giterr_set(GITERR_INVALID, "Invalid version %d for git_transport", version);
-		return -1;
-	} else {
-		git_transport o = GIT_TRANSPORT_INIT;
-		memcpy(opts, &o, sizeof(o));
-		return 0;
-	}
+	GIT_INIT_STRUCTURE_FROM_TEMPLATE(
+		opts, version, git_transport, GIT_TRANSPORT_INIT);
+	return 0;
 }

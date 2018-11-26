@@ -5,14 +5,16 @@
  * a Linking Exception. For full terms see the included COPYING file.
  */
 
+#ifdef GIT_SSH
+#include <libssh2.h>
+#endif
+
 #include "git2.h"
 #include "buffer.h"
 #include "netops.h"
 #include "smart.h"
 
 #ifdef GIT_SSH
-
-#include <libssh2.h>
 
 #define OWNING_SUBTRANSPORT(s) ((ssh_subtransport *)(s)->parent.subtransport)
 
@@ -132,11 +134,22 @@ static int ssh_stream_write(
 	size_t len)
 {
 	ssh_stream *s = (ssh_stream *)stream;
+	size_t off = 0;
+	ssize_t ret = 0;
 
 	if (!s->sent_command && send_command(s) < 0)
 		return -1;
 
-	if (libssh2_channel_write(s->channel, buffer, len) < LIBSSH2_ERROR_NONE) {
+	do {
+		ret = libssh2_channel_write(s->channel, buffer + off, len - off);
+		if (ret < 0)
+			break;
+
+		off += ret;
+
+	} while (off < len);
+
+	if (ret < 0) {
 		ssh_error(s->session, "SSH could not write data");
 		return -1;
 	}
@@ -387,7 +400,7 @@ static int _git_ssh_setup_conn(
 {
 	char *host=NULL, *port=NULL, *path=NULL, *user=NULL, *pass=NULL;
 	const char *default_port="22";
-	int no_callback = 0;
+	int no_callback = 0, error;;
 	ssh_stream *s;
 	LIBSSH2_SESSION* session=NULL;
 	LIBSSH2_CHANNEL* channel=NULL;
@@ -399,16 +412,16 @@ static int _git_ssh_setup_conn(
 	s = (ssh_stream *)*stream;
 
 	if (!git__prefixcmp(url, prefix_ssh)) {
-		if (gitno_extract_url_parts(&host, &port, &path, &user, &pass, url, default_port) < 0)
+		if ((error = gitno_extract_url_parts(&host, &port, &path, &user, &pass, url, default_port)) < 0)
 			goto on_error;
 	} else {
-		if (git_ssh_extract_url_parts(&host, &user, url) < 0)
+		if ((error = git_ssh_extract_url_parts(&host, &user, url)) < 0)
 			goto on_error;
 		port = git__strdup(default_port);
 		GITERR_CHECK_ALLOC(port);
 	}
 
-	if (gitno_connect(&s->socket, host, port, 0) < 0)
+	if ((error = gitno_connect(&s->socket, host, port, 0)) < 0)
 		goto on_error;
 
 	if (user && pass) {
@@ -430,12 +443,14 @@ static int _git_ssh_setup_conn(
 			goto on_error;
 		else if (!t->cred) {
 			giterr_set(GITERR_SSH, "Callback failed to initialize SSH credentials");
+                        error = -1;
 			goto on_error;
 		}
 	}
 
 	if (no_callback) {
 		giterr_set(GITERR_SSH, "authentication required but no callback set");
+                error = -1;
 		goto on_error;
 	}
 
@@ -444,12 +459,46 @@ static int _git_ssh_setup_conn(
 	if (_git_ssh_session_create(&session, s->socket) < 0)
 		goto on_error;
 
-	if (_git_ssh_authenticate_session(session, t->cred) < 0)
+        if (t->owner->certificate_check_cb != NULL) {
+                git_cert_hostkey cert;
+                const char *key;
+                int allow;
+
+                cert.type = LIBSSH2_HOSTKEY_HASH_SHA1;
+                key = libssh2_hostkey_hash(session, LIBSSH2_HOSTKEY_HASH_SHA1);
+                if (key != NULL) {
+                        memcpy(&cert.hash, key, 20);
+                } else {
+                        cert.type = LIBSSH2_HOSTKEY_HASH_MD5;
+                        key = libssh2_hostkey_hash(session, LIBSSH2_HOSTKEY_HASH_MD5);
+                        if (key != NULL)
+                                memcpy(&cert.hash, key, 16);
+                }
+
+                if (key == NULL) {
+                        giterr_set(GITERR_SSH, "unable to get the host key");
+                        return -1;
+                }
+
+                allow = t->owner->certificate_check_cb(GIT_CERT_HOSTKEY_LIBSSH2, &cert, t->owner->message_cb_payload);
+                if (allow < 0) {
+                        error = allow;
+                        goto on_error;
+                }
+
+                if (!allow) {
+                        error = GIT_ECERTIFICATE;
+                        goto on_error;
+                }
+        }
+
+	if ((error =_git_ssh_authenticate_session(session, t->cred)) < 0)
 		goto on_error;
 
 	channel = libssh2_channel_open_session(session);
 	if (!channel) {
 		ssh_error(session, "Failed to open SSH channel");
+                error = -1;
 		goto on_error;
 	}
 
@@ -483,7 +532,7 @@ on_error:
 	if (session)
 		libssh2_session_free(session);
 
-	return -1;
+	return error;
 }
 
 static int ssh_uploadpack_ls(
