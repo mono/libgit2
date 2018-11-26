@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -23,6 +23,10 @@
 #define GIT_MAP_TYPE	0xf
 #define GIT_MAP_FIXED	0x10
 
+#ifdef __amigaos4__
+#define MAP_FAILED 0
+#endif
+
 typedef struct { /* memory mapped buffer	*/
 	void *data; /* data bytes			*/
 	size_t len; /* data length			*/
@@ -31,7 +35,13 @@ typedef struct { /* memory mapped buffer	*/
 #endif
 } git_map;
 
+#define GIT_MMAP_VALIDATE(out, len, prot, flags) do { \
+	assert(out != NULL && len > 0); \
+	assert((prot & GIT_PROT_WRITE) || (prot & GIT_PROT_READ)); \
+	assert((flags & GIT_MAP_FIXED) == 0); } while (0)
+
 extern int p_mmap(git_map *out, size_t len, int prot, int flags, int fd, git_off_t offset);
 extern int p_munmap(git_map *map);
+extern long git__page_size(void);
 
 #endif /* INCLUDE_map_h__ */

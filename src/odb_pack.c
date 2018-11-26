@@ -1,14 +1,15 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
  */
 
 #include "common.h"
-#include "git2/zlib.h"
+#include <zlib.h>
 #include "git2/repository.h"
-#include "git2/oid.h"
+#include "git2/indexer.h"
+#include "git2/sys/odb_backend.h"
 #include "fileops.h"
 #include "hash.h"
 #include "odb.h"
@@ -24,7 +25,11 @@ struct pack_backend {
 	git_vector packs;
 	struct git_pack_file *last_found;
 	char *pack_folder;
-	time_t pack_folder_mtime;
+};
+
+struct pack_writepack {
+	struct git_odb_writepack parent;
+	git_indexer *indexer;
 };
 
 /**
@@ -128,28 +133,24 @@ struct pack_backend {
  *
  ***********************************************************/
 
-static void pack_window_free_all(struct pack_backend *backend, struct git_pack_file *p);
-static int pack_window_contains(git_mwindow *win, off_t offset);
-
 static int packfile_sort__cb(const void *a_, const void *b_);
 
 static int packfile_load__cb(void *_data, git_buf *path);
-static int packfile_refresh_all(struct pack_backend *backend);
 
 static int pack_entry_find(struct git_pack_entry *e,
-		struct pack_backend *backend, const git_oid *oid);
+	struct pack_backend *backend, const git_oid *oid);
 
 /* Can find the offset of an object given
  * a prefix of an identifier.
- * Throws GIT_EAMBIGUOUSOIDPREFIX if short oid
- * is ambiguous.
+ * Sets GIT_EAMBIGUOUS if short oid is ambiguous.
  * This method assumes that len is between
  * GIT_OID_MINPREFIXLEN and GIT_OID_HEXSZ.
  */
-static int pack_entry_find_prefix(struct git_pack_entry *e,
-					struct pack_backend *backend,
-					const git_oid *short_oid,
-					unsigned int len);
+static int pack_entry_find_prefix(
+	struct git_pack_entry *e,
+	struct pack_backend *backend,
+	const git_oid *short_oid,
+	size_t len);
 
 
 
@@ -158,23 +159,6 @@ static int pack_entry_find_prefix(struct git_pack_entry *e,
  * PACK WINDOW MANAGEMENT
  *
  ***********************************************************/
-
-GIT_INLINE(void) pack_window_free_all(struct pack_backend *GIT_UNUSED(backend), struct git_pack_file *p)
-{
-	GIT_UNUSED_ARG(backend);
-	git_mwindow_free_all(&p->mwf);
-}
-
-GIT_INLINE(int) pack_window_contains(git_mwindow *win, off_t offset)
-{
-	/* We must promise at least 20 bytes (one hash) after the
-	 * offset is available from this window, otherwise the offset
-	 * is not actually in this window and a different window (which
-	 * has that one hash excess) must be used. This is to support
-	 * the object header and delta base parsing routines below.
-	 */
-	return git_mwindow_contains(win, offset + 20);
-}
 
 static int packfile_sort__cb(const void *a_, const void *b_)
 {
@@ -206,114 +190,102 @@ static int packfile_sort__cb(const void *a_, const void *b_)
 }
 
 
-
-static int packfile_load__cb(void *_data, git_buf *path)
+static int packfile_load__cb(void *data, git_buf *path)
 {
-	struct pack_backend *backend = (struct pack_backend *)_data;
+	struct pack_backend *backend = data;
 	struct git_pack_file *pack;
+	const char *path_str = git_buf_cstr(path);
+	size_t i, cmp_len = git_buf_len(path);
 	int error;
-	size_t i;
 
-	if (git__suffixcmp(path->ptr, ".idx") != 0)
-		return GIT_SUCCESS; /* not an index */
+	if (cmp_len <= strlen(".idx") || git__suffixcmp(path_str, ".idx") != 0)
+		return 0; /* not an index */
+
+	cmp_len -= strlen(".idx");
 
 	for (i = 0; i < backend->packs.length; ++i) {
 		struct git_pack_file *p = git_vector_get(&backend->packs, i);
-		if (memcmp(p->pack_name, path->ptr, path->size - strlen(".idx")) == 0)
-			return GIT_SUCCESS;
+
+		if (memcmp(p->pack_name, path_str, cmp_len) == 0)
+			return 0;
 	}
 
-	error = git_packfile_check(&pack, path->ptr);
+	error = git_packfile_alloc(&pack, path->ptr);
+
+	/* ignore missing .pack file as git does */
 	if (error == GIT_ENOTFOUND) {
-		/* ignore missing .pack file as git does */
-		return GIT_SUCCESS;
-	} else if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to load packfile");
-
-	if (git_vector_insert(&backend->packs, pack) < GIT_SUCCESS) {
-		git__free(pack);
-		return GIT_ENOMEM;
+		giterr_clear();
+		return 0;
 	}
 
-	return GIT_SUCCESS;
+	if (!error)
+		error = git_vector_insert(&backend->packs, pack);
+
+	return error;
+
 }
 
-static int packfile_refresh_all(struct pack_backend *backend)
+static int pack_entry_find_inner(
+	struct git_pack_entry *e,
+	struct pack_backend *backend,
+	const git_oid *oid,
+	struct git_pack_file *last_found)
 {
-	int error;
-	struct stat st;
-
-	if (backend->pack_folder == NULL)
-		return GIT_SUCCESS;
-
-	if (p_stat(backend->pack_folder, &st) < 0 || !S_ISDIR(st.st_mode))
-		return git__throw(GIT_ENOTFOUND, "Failed to refresh packfiles. Backend not found");
-
-	if (st.st_mtime != backend->pack_folder_mtime) {
-		git_buf path = GIT_BUF_INIT;
-		git_buf_sets(&path, backend->pack_folder);
-
-		/* reload all packs */
-		error = git_path_direach(&path, packfile_load__cb, (void *)backend);
-
-		git_buf_free(&path);
-		if (error < GIT_SUCCESS)
-			return git__rethrow(error, "Failed to refresh packfiles");
-
-		git_vector_sort(&backend->packs);
-		backend->pack_folder_mtime = st.st_mtime;
-	}
-
-	return GIT_SUCCESS;
-}
-
-static int pack_entry_find(struct git_pack_entry *e, struct pack_backend *backend, const git_oid *oid)
-{
-	int error;
 	size_t i;
 
-	if ((error = packfile_refresh_all(backend)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to find pack entry");
-
-	if (backend->last_found &&
-		git_pack_entry_find(e, backend->last_found, oid, GIT_OID_HEXSZ) == GIT_SUCCESS)
-		return GIT_SUCCESS;
+	if (last_found &&
+		git_pack_entry_find(e, last_found, oid, GIT_OID_HEXSZ) == 0)
+		return 0;
 
 	for (i = 0; i < backend->packs.length; ++i) {
 		struct git_pack_file *p;
 
 		p = git_vector_get(&backend->packs, i);
-		if (p == backend->last_found)
+		if (p == last_found)
 			continue;
 
-		if (git_pack_entry_find(e, p, oid, GIT_OID_HEXSZ) == GIT_SUCCESS) {
+		if (git_pack_entry_find(e, p, oid, GIT_OID_HEXSZ) == 0) {
 			backend->last_found = p;
-			return GIT_SUCCESS;
+			return 0;
 		}
 	}
 
-	return git__throw(GIT_ENOTFOUND, "Failed to find pack entry");
+	return -1;
+}
+
+static int pack_entry_find(struct git_pack_entry *e, struct pack_backend *backend, const git_oid *oid)
+{
+	struct git_pack_file *last_found = backend->last_found;
+
+	if (backend->last_found &&
+		git_pack_entry_find(e, backend->last_found, oid, GIT_OID_HEXSZ) == 0)
+		return 0;
+
+	if (!pack_entry_find_inner(e, backend, oid, last_found))
+		return 0;
+
+	return git_odb__error_notfound("failed to find pack entry", oid);
 }
 
 static int pack_entry_find_prefix(
 	struct git_pack_entry *e,
 	struct pack_backend *backend,
 	const git_oid *short_oid,
-	unsigned int len)
+	size_t len)
 {
 	int error;
 	size_t i;
-	unsigned found = 0;
+	git_oid found_full_oid = {{0}};
+	bool found = false;
+	struct git_pack_file *last_found = backend->last_found;
 
-	if ((error = packfile_refresh_all(backend)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to find pack entry");
-
-	if (backend->last_found) {
-		error = git_pack_entry_find(e, backend->last_found, short_oid, len);
-		if (error == GIT_EAMBIGUOUSOIDPREFIX) {
-			return git__rethrow(error, "Failed to find pack entry. Ambiguous sha1 prefix");
-		} else if (error == GIT_SUCCESS) {
-			found = 1;
+	if (last_found) {
+		error = git_pack_entry_find(e, last_found, short_oid, len);
+		if (error == GIT_EAMBIGUOUS)
+			return error;
+		if (!error) {
+			git_oid_cpy(&found_full_oid, &e->sha1);
+			found = true;
 		}
 	}
 
@@ -321,28 +293,25 @@ static int pack_entry_find_prefix(
 		struct git_pack_file *p;
 
 		p = git_vector_get(&backend->packs, i);
-		if (p == backend->last_found)
+		if (p == last_found)
 			continue;
 
 		error = git_pack_entry_find(e, p, short_oid, len);
-		if (error == GIT_EAMBIGUOUSOIDPREFIX) {
-			return git__rethrow(error, "Failed to find pack entry. Ambiguous sha1 prefix");
-		} else if (error == GIT_SUCCESS) {
-			found++;
-			if (found > 1)
-				break;
+		if (error == GIT_EAMBIGUOUS)
+			return error;
+		if (!error) {
+			if (found && git_oid_cmp(&e->sha1, &found_full_oid))
+				return git_odb__error_ambiguous("found multiple pack entries");
+			git_oid_cpy(&found_full_oid, &e->sha1);
+			found = true;
 			backend->last_found = p;
 		}
 	}
 
-	if (!found) {
-		return git__rethrow(GIT_ENOTFOUND, "Failed to find pack entry");
-	} else if (found > 1) {
-		return git__rethrow(GIT_EAMBIGUOUSOIDPREFIX, "Failed to find pack entry. Ambiguous sha1 prefix");
-	} else {
-		return GIT_SUCCESS;
-	}
-
+	if (!found)
+		return git_odb__error_notfound("no matching pack entry for prefix", short_oid);
+	else
+		return 0;
 }
 
 
@@ -353,38 +322,133 @@ static int pack_entry_find_prefix(
  * Implement the git_odb_backend API calls
  *
  ***********************************************************/
-
-/*
-int pack_backend__read_header(git_rawobj *obj, git_odb_backend *backend, const git_oid *oid)
+static int pack_backend__refresh(git_odb_backend *backend_)
 {
-	pack_location location;
+	int error;
+	struct stat st;
+	git_buf path = GIT_BUF_INIT;
+	struct pack_backend *backend = (struct pack_backend *)backend_;
 
-	assert(obj && backend && oid);
+	if (backend->pack_folder == NULL)
+		return 0;
 
-	if (locate_packfile(&location, (struct pack_backend *)backend, oid) < 0)
-		return GIT_ENOTFOUND;
+	if (p_stat(backend->pack_folder, &st) < 0 || !S_ISDIR(st.st_mode))
+		return git_odb__error_notfound("failed to refresh packfiles", NULL);
 
-	return read_header_packed(obj, &location);
+	git_buf_sets(&path, backend->pack_folder);
+
+	/* reload all packs */
+	error = git_path_direach(&path, 0, packfile_load__cb, backend);
+
+	git_buf_free(&path);
+	git_vector_sort(&backend->packs);
+
+	return error;
 }
-*/
 
-static int pack_backend__read(void **buffer_p, size_t *len_p, git_otype *type_p, git_odb_backend *backend, const git_oid *oid)
+static int pack_backend__read_header_internal(
+	size_t *len_p, git_otype *type_p,
+	struct git_odb_backend *backend, const git_oid *oid)
+{
+	struct git_pack_entry e;
+	int error;
+
+	assert(len_p && type_p && backend && oid);
+
+	if ((error = pack_entry_find(&e, (struct pack_backend *)backend, oid)) < 0)
+		return error;
+
+	return git_packfile_resolve_header(len_p, type_p, e.p, e.offset);
+}
+
+static int pack_backend__read_header(
+	size_t *len_p, git_otype *type_p,
+	struct git_odb_backend *backend, const git_oid *oid)
+{
+	int error;
+
+	error = pack_backend__read_header_internal(len_p, type_p, backend, oid);
+
+	if (error != GIT_ENOTFOUND)
+		return error;
+
+	if ((error = pack_backend__refresh(backend)) < 0)
+		return error;
+
+	return pack_backend__read_header_internal(len_p, type_p, backend, oid);
+}
+
+static int pack_backend__read_internal(
+	void **buffer_p, size_t *len_p, git_otype *type_p,
+	git_odb_backend *backend, const git_oid *oid)
 {
 	struct git_pack_entry e;
 	git_rawobj raw;
 	int error;
 
-	if ((error = pack_entry_find(&e, (struct pack_backend *)backend, oid)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to read pack backend");
-
-	if ((error = git_packfile_unpack(&raw, e.p, &e.offset)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to read pack backend");
+	if ((error = pack_entry_find(&e, (struct pack_backend *)backend, oid)) < 0 ||
+		(error = git_packfile_unpack(&raw, e.p, &e.offset)) < 0)
+		return error;
 
 	*buffer_p = raw.data;
 	*len_p = raw.len;
 	*type_p = raw.type;
 
-	return GIT_SUCCESS;
+	return 0;
+}
+
+static int pack_backend__read(
+	void **buffer_p, size_t *len_p, git_otype *type_p,
+	git_odb_backend *backend, const git_oid *oid)
+{
+	int error;
+
+	error = pack_backend__read_internal(buffer_p, len_p, type_p, backend, oid);
+
+	if (error != GIT_ENOTFOUND)
+		return error;
+
+	if ((error = pack_backend__refresh(backend)) < 0)
+		return error;
+
+	return pack_backend__read_internal(buffer_p, len_p, type_p, backend, oid);
+}
+
+static int pack_backend__read_prefix_internal(
+	git_oid *out_oid,
+	void **buffer_p,
+	size_t *len_p,
+	git_otype *type_p,
+	git_odb_backend *backend,
+	const git_oid *short_oid,
+	size_t len)
+{
+	int error = 0;
+
+	if (len < GIT_OID_MINPREFIXLEN)
+		error = git_odb__error_ambiguous("prefix length too short");
+
+	else if (len >= GIT_OID_HEXSZ) {
+		/* We can fall back to regular read method */
+		error = pack_backend__read(buffer_p, len_p, type_p, backend, short_oid);
+		if (!error)
+			git_oid_cpy(out_oid, short_oid);
+	} else {
+		struct git_pack_entry e;
+		git_rawobj raw;
+
+		if ((error = pack_entry_find_prefix(
+				&e, (struct pack_backend *)backend, short_oid, len)) == 0 &&
+			(error = git_packfile_unpack(&raw, e.p, &e.offset)) == 0)
+		{
+			*buffer_p = raw.data;
+			*len_p = raw.len;
+			*type_p = raw.type;
+			git_oid_cpy(out_oid, &e.sha1);
+		}
+	}
+
+	return error;
 }
 
 static int pack_backend__read_prefix(
@@ -394,42 +458,140 @@ static int pack_backend__read_prefix(
 	git_otype *type_p,
 	git_odb_backend *backend,
 	const git_oid *short_oid,
-	unsigned int len)
+	size_t len)
 {
-	if (len < GIT_OID_MINPREFIXLEN)
-		return git__throw(GIT_EAMBIGUOUSOIDPREFIX, "Failed to read pack backend. Prefix length is lower than %d.", GIT_OID_MINPREFIXLEN);
+	int error;
 
-	if (len >= GIT_OID_HEXSZ) {
-		/* We can fall back to regular read method */
-		int error = pack_backend__read(buffer_p, len_p, type_p, backend, short_oid);
-		if (error == GIT_SUCCESS)
-			git_oid_cpy(out_oid, short_oid);
+	error = pack_backend__read_prefix_internal(
+		out_oid, buffer_p, len_p, type_p, backend, short_oid, len);
 
+	if (error != GIT_ENOTFOUND)
 		return error;
-	} else {
-		struct git_pack_entry e;
-		git_rawobj raw;
-		int error;
 
-		if ((error = pack_entry_find_prefix(&e, (struct pack_backend *)backend, short_oid, len)) < GIT_SUCCESS)
-			return git__rethrow(error, "Failed to read pack backend");
+	if ((error = pack_backend__refresh(backend)) < 0)
+		return error;
 
-		if ((error = git_packfile_unpack(&raw, e.p, &e.offset)) < GIT_SUCCESS)
-			return git__rethrow(error, "Failed to read pack backend");
-
-		*buffer_p = raw.data;
-		*len_p = raw.len;
-		*type_p = raw.type;
-		git_oid_cpy(out_oid, &e.sha1);
-	}
-
-	return GIT_SUCCESS;
+	return pack_backend__read_prefix_internal(
+		out_oid, buffer_p, len_p, type_p, backend, short_oid, len);
 }
 
 static int pack_backend__exists(git_odb_backend *backend, const git_oid *oid)
 {
 	struct git_pack_entry e;
-	return pack_entry_find(&e, (struct pack_backend *)backend, oid) == GIT_SUCCESS;
+	int error;
+
+	error = pack_entry_find(&e, (struct pack_backend *)backend, oid);
+
+	if (error != GIT_ENOTFOUND)
+		return error == 0;
+
+	if ((error = pack_backend__refresh(backend)) < 0) {
+		giterr_clear();
+		return (int)false;
+	}
+
+	return pack_entry_find(&e, (struct pack_backend *)backend, oid) == 0;
+}
+
+static int pack_backend__exists_prefix(
+	git_oid *out, git_odb_backend *backend, const git_oid *short_id, size_t len)
+{
+	int error;
+	struct pack_backend *pb = (struct pack_backend *)backend;
+	struct git_pack_entry e = {0};
+
+	error = pack_entry_find_prefix(&e, pb, short_id, len);
+
+	if (error == GIT_ENOTFOUND && !(error = pack_backend__refresh(backend)))
+		error = pack_entry_find_prefix(&e, pb, short_id, len);
+
+	git_oid_cpy(out, &e.sha1);
+
+	return error;
+}
+
+static int pack_backend__foreach(git_odb_backend *_backend, git_odb_foreach_cb cb, void *data)
+{
+	int error;
+	struct git_pack_file *p;
+	struct pack_backend *backend;
+	unsigned int i;
+
+	assert(_backend && cb);
+	backend = (struct pack_backend *)_backend;
+
+	/* Make sure we know about the packfiles */
+	if ((error = pack_backend__refresh(_backend)) < 0)
+		return error;
+
+	git_vector_foreach(&backend->packs, i, p) {
+		if ((error = git_pack_foreach_entry(p, cb, data)) < 0)
+			return error;
+	}
+
+	return 0;
+}
+
+static int pack_backend__writepack_append(struct git_odb_writepack *_writepack, const void *data, size_t size, git_transfer_progress *stats)
+{
+	struct pack_writepack *writepack = (struct pack_writepack *)_writepack;
+
+	assert(writepack);
+
+	return git_indexer_append(writepack->indexer, data, size, stats);
+}
+
+static int pack_backend__writepack_commit(struct git_odb_writepack *_writepack, git_transfer_progress *stats)
+{
+	struct pack_writepack *writepack = (struct pack_writepack *)_writepack;
+
+	assert(writepack);
+
+	return git_indexer_commit(writepack->indexer, stats);
+}
+
+static void pack_backend__writepack_free(struct git_odb_writepack *_writepack)
+{
+	struct pack_writepack *writepack = (struct pack_writepack *)_writepack;
+
+	assert(writepack);
+
+	git_indexer_free(writepack->indexer);
+	git__free(writepack);
+}
+
+static int pack_backend__writepack(struct git_odb_writepack **out,
+	git_odb_backend *_backend,
+        git_odb *odb,
+	git_transfer_progress_cb progress_cb,
+	void *progress_payload)
+{
+	struct pack_backend *backend;
+	struct pack_writepack *writepack;
+
+	assert(out && _backend);
+
+	*out = NULL;
+
+	backend = (struct pack_backend *)_backend;
+
+	writepack = git__calloc(1, sizeof(struct pack_writepack));
+	GITERR_CHECK_ALLOC(writepack);
+
+	if (git_indexer_new(&writepack->indexer,
+		backend->pack_folder, 0, odb, progress_cb, progress_payload) < 0) {
+		git__free(writepack);
+		return -1;
+	}
+
+	writepack->parent.backend = _backend;
+	writepack->parent.append = pack_backend__writepack_append;
+	writepack->parent.commit = pack_backend__writepack_commit;
+	writepack->parent.free = pack_backend__writepack_free;
+
+	*out = (git_odb_writepack *)writepack;
+
+	return 0;
 }
 
 static void pack_backend__free(git_odb_backend *_backend)
@@ -443,7 +605,7 @@ static void pack_backend__free(git_odb_backend *_backend)
 
 	for (i = 0; i < backend->packs.length; ++i) {
 		struct git_pack_file *p = git_vector_get(&backend->packs, i);
-		packfile_free(p);
+		git_packfile_free(p);
 	}
 
 	git_vector_free(&backend->packs);
@@ -451,40 +613,75 @@ static void pack_backend__free(git_odb_backend *_backend)
 	git__free(backend);
 }
 
-int git_odb_backend_pack(git_odb_backend **backend_out, const char *objects_dir)
+static int pack_backend__alloc(struct pack_backend **out, size_t initial_size)
 {
-	struct pack_backend *backend = NULL;
-	git_buf path = GIT_BUF_INIT;
-	int error = GIT_SUCCESS;
+	struct pack_backend *backend = git__calloc(1, sizeof(struct pack_backend));
+	GITERR_CHECK_ALLOC(backend);
 
-	backend = git__calloc(1, sizeof(struct pack_backend));
-	if (backend == NULL)
-		return GIT_ENOMEM;
-
-	error = git_vector_init(&backend->packs, 8, packfile_sort__cb);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	error = git_buf_joinpath(&path, objects_dir, "pack");
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	if (git_path_isdir(git_buf_cstr(&path)) == GIT_SUCCESS) {
-		backend->pack_folder = git_buf_detach(&path);
-		backend->pack_folder_mtime = 0;
+	if (git_vector_init(&backend->packs, initial_size, packfile_sort__cb) < 0) {
+		git__free(backend);
+		return -1;
 	}
+
+	backend->parent.version = GIT_ODB_BACKEND_VERSION;
 
 	backend->parent.read = &pack_backend__read;
 	backend->parent.read_prefix = &pack_backend__read_prefix;
-	backend->parent.read_header = NULL;
+	backend->parent.read_header = &pack_backend__read_header;
 	backend->parent.exists = &pack_backend__exists;
+	backend->parent.exists_prefix = &pack_backend__exists_prefix;
+	backend->parent.refresh = &pack_backend__refresh;
+	backend->parent.foreach = &pack_backend__foreach;
+	backend->parent.writepack = &pack_backend__writepack;
 	backend->parent.free = &pack_backend__free;
+
+	*out = backend;
+	return 0;
+}
+
+int git_odb_backend_one_pack(git_odb_backend **backend_out, const char *idx)
+{
+	struct pack_backend *backend = NULL;
+	struct git_pack_file *packfile = NULL;
+
+	if (pack_backend__alloc(&backend, 1) < 0)
+		return -1;
+
+	if (git_packfile_alloc(&packfile, idx) < 0 ||
+		git_vector_insert(&backend->packs, packfile) < 0)
+	{
+		pack_backend__free((git_odb_backend *)backend);
+		return -1;
+	}
+
+	*backend_out = (git_odb_backend *)backend;
+	return 0;
+}
+
+int git_odb_backend_pack(git_odb_backend **backend_out, const char *objects_dir)
+{
+	int error = 0;
+	struct pack_backend *backend = NULL;
+	git_buf path = GIT_BUF_INIT;
+
+	if (pack_backend__alloc(&backend, 8) < 0)
+		return -1;
+
+	if (!(error = git_buf_joinpath(&path, objects_dir, "pack")) &&
+		git_path_isdir(git_buf_cstr(&path)))
+	{
+		backend->pack_folder = git_buf_detach(&path);
+
+		error = pack_backend__refresh((git_odb_backend *)backend);
+	}
+
+	if (error < 0) {
+		pack_backend__free((git_odb_backend *)backend);
+		backend = NULL;
+	}
 
 	*backend_out = (git_odb_backend *)backend;
 
-cleanup:
-	if (error < GIT_SUCCESS)
-		git__free(backend);
 	git_buf_free(&path);
 
 	return error;

@@ -1,11 +1,13 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
  */
 #ifndef INCLUDE_compat_h__
 #define INCLUDE_compat_h__
+
+#include <stdarg.h>
 
 /*
  * See if our compiler is known to support flexible array members.
@@ -33,27 +35,15 @@
 #	define GIT_TYPEOF(x)
 #endif
 
-#ifdef __cplusplus
-#	define GIT_UNUSED(x)
-#else
-#	ifdef __GNUC__
-#		define GIT_UNUSED(x) x __attribute__ ((__unused__))
-#	else
-#		define GIT_UNUSED(x) x
-#	endif
-#endif
-
-#if defined(_MSC_VER)
-#define GIT_UNUSED_ARG(x) ((void)(x)); /* note trailing ; */
-#else
-#define GIT_UNUSED_ARG(x)
-#endif
+#define GIT_UNUSED(x) ((void)(x))
 
 /* Define the printf format specifer to use for size_t output */
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #	define PRIuZ "Iu"
+#	define PRIxZ "Ix"
 #else
 #	define PRIuZ "zu"
+#	define PRIxZ "zx"
 #endif
 
 /* Micosoft Visual C/C++ */
@@ -62,6 +52,26 @@
 #	pragma warning ( disable : 4996 )
 /* disable "conditional expression is constant" level 4 warnings */
 #	pragma warning ( disable : 4127 )
+#endif
+
+#if defined (_MSC_VER)
+	typedef unsigned char bool;
+#	ifndef true
+#		define true 1
+#	endif
+#	ifndef false
+#		define false 0
+#	endif
+#else
+#	include <stdbool.h>
+#endif
+
+#ifndef va_copy
+#	ifdef __va_copy
+#		define va_copy(dst, src) __va_copy(dst, src)
+#	else
+#		define va_copy(dst, src) ((dst) = (src))
+#	endif
 #endif
 
 #endif /* INCLUDE_compat_h__ */

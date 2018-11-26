@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -36,6 +36,19 @@ static int hdr_sz(
 	return 0;
 }
 
+int git__delta_read_header(
+	const unsigned char *delta,
+	size_t delta_len,
+	size_t *base_sz,
+	size_t *res_sz)
+{
+	const unsigned char *delta_end = delta + delta_len;
+	if ((hdr_sz(base_sz, &delta, delta_end) < 0) ||
+	    (hdr_sz(res_sz, &delta, delta_end) < 0))
+		return -1;
+	return 0;
+}
+
 int git__delta_apply(
 	git_rawobj *out,
 	const unsigned char *base,
@@ -51,14 +64,19 @@ int git__delta_apply(
 	 * if not we would underflow while accessing data from the
 	 * base object, resulting in data corruption or segfault.
 	 */
-	if ((hdr_sz(&base_sz, &delta, delta_end) < 0) || (base_sz != base_len))
-		return git__throw(GIT_ERROR, "Failed to apply delta. Base size does not match given data");
+	if ((hdr_sz(&base_sz, &delta, delta_end) < 0) || (base_sz != base_len)) {
+		giterr_set(GITERR_INVALID, "Failed to apply delta. Base size does not match given data");
+		return -1;
+	}
 
-	if (hdr_sz(&res_sz, &delta, delta_end) < 0)
-		return git__throw(GIT_ERROR, "Failed to apply delta. Base size does not match given data");
+	if (hdr_sz(&res_sz, &delta, delta_end) < 0) {
+		giterr_set(GITERR_INVALID, "Failed to apply delta. Base size does not match given data");
+		return -1;
+	}
 
-	if ((res_dp = git__malloc(res_sz + 1)) == NULL)
-		return GIT_ENOMEM;
+	res_dp = git__malloc(res_sz + 1);
+	GITERR_CHECK_ALLOC(res_dp);
+
 	res_dp[res_sz] = '\0';
 	out->data = res_dp;
 	out->len = res_sz;
@@ -106,10 +124,11 @@ int git__delta_apply(
 
 	if (delta != delta_end || res_sz)
 		goto fail;
-	return GIT_SUCCESS;
+	return 0;
 
 fail:
 	git__free(out->data);
 	out->data = NULL;
-	return git__throw(GIT_ERROR, "Failed to apply delta");
+	giterr_set(GITERR_INVALID, "Failed to apply delta");
+	return -1;
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -9,27 +9,41 @@
 
 #include "git2/refspec.h"
 #include "buffer.h"
+#include "vector.h"
 
 struct git_refspec {
-	struct git_refspec *next;
+	char *string;
 	char *src;
 	char *dst;
 	unsigned int force :1,
+		push : 1,
 		pattern :1,
 		matching :1;
 };
 
-int git_refspec_parse(struct git_refspec *refspec, const char *str);
+#define GIT_REFSPEC_TAGS "refs/tags/*:refs/tags/*"
+
+int git_refspec__parse(
+	struct git_refspec *refspec,
+	const char *str,
+	bool is_fetch);
+
+void git_refspec__free(git_refspec *refspec);
+
+int git_refspec__serialize(git_buf *out, const git_refspec *refspec);
 
 /**
- * Transform a reference to its target following the refspec's rules,
- * and writes the results into a git_buf.
+ * Determines if a refspec is a wildcard refspec.
  *
- * @param out where to store the target name
  * @param spec the refspec
- * @param name the name of the reference to transform
- * @return GIT_SUCCESS or error if buffer allocation fails
+ * @return 1 if the refspec is a wildcard, 0 otherwise
  */
-int git_refspec_transform_r(git_buf *out, const git_refspec *spec, const char *name);
+int git_refspec_is_wildcard(const git_refspec *spec);
+
+/**
+ * DWIM `spec` with `refs` existing on the remote, append the dwim'ed
+ * result in `out`.
+ */
+int git_refspec__dwim_one(git_vector *out, git_refspec *spec, git_vector *refs);
 
 #endif

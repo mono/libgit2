@@ -1,28 +1,29 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
  */
 #include <git2/common.h>
 
-#ifndef GIT_WIN32
+#if !defined(GIT_WIN32) && !defined(NO_MMAP)
 
 #include "map.h"
 #include <sys/mman.h>
+#include <unistd.h>
 #include <errno.h>
+
+long git__page_size(void)
+{
+	return sysconf(_SC_PAGE_SIZE);
+}
 
 int p_mmap(git_map *out, size_t len, int prot, int flags, int fd, git_off_t offset)
 {
 	int mprot = 0;
 	int mflag = 0;
 
-	assert((out != NULL) && (len > 0));
-
-	if ((out == NULL) || (len == 0)) {
-		errno = EINVAL;
-		return git__throw(GIT_ERROR, "Failed to mmap. No map or zero length");
-	}
+	GIT_MMAP_VALIDATE(out, len, prot, flags);
 
 	out->data = NULL;
 	out->len = 0;
@@ -31,39 +32,32 @@ int p_mmap(git_map *out, size_t len, int prot, int flags, int fd, git_off_t offs
 		mprot = PROT_WRITE;
 	else if (prot & GIT_PROT_READ)
 		mprot = PROT_READ;
-	else {
-		errno = EINVAL;
-		return git__throw(GIT_ERROR, "Failed to mmap. Invalid protection parameters");
-	}
 
 	if ((flags & GIT_MAP_TYPE) == GIT_MAP_SHARED)
 		mflag = MAP_SHARED;
 	else if ((flags & GIT_MAP_TYPE) == GIT_MAP_PRIVATE)
 		mflag = MAP_PRIVATE;
-
-	if (flags & GIT_MAP_FIXED) {
-		errno = EINVAL;
-		return git__throw(GIT_ERROR, "Failed to mmap. FIXED not set");
-	}
+	else
+		mflag = MAP_SHARED;
 
 	out->data = mmap(NULL, len, mprot, mflag, fd, offset);
-	if (!out->data || out->data == MAP_FAILED)
-		return git__throw(GIT_EOSERR, "Failed to mmap. Could not write data");
+
+	if (!out->data || out->data == MAP_FAILED) {
+		giterr_set(GITERR_OS, "Failed to mmap. Could not write data");
+		return -1;
+	}
+
 	out->len = len;
 
-	return GIT_SUCCESS;
+	return 0;
 }
 
 int p_munmap(git_map *map)
 {
 	assert(map != NULL);
-
-	if (!map)
-		return git__throw(GIT_ERROR, "Failed to munmap. Map does not exist");
-
 	munmap(map->data, map->len);
 
-	return GIT_SUCCESS;
+	return 0;
 }
 
 #endif

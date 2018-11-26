@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -10,6 +10,7 @@
 #include "common.h"
 #include "types.h"
 #include "oid.h"
+#include "buffer.h"
 
 /**
  * @file git2/object.h
@@ -21,7 +22,7 @@
 GIT_BEGIN_DECL
 
 /**
- * Lookup a reference to one of the objects in a repostory.
+ * Lookup a reference to one of the objects in a repository.
  *
  * The generated reference is owned by the repository and
  * should be closed with the `git_object_free` method
@@ -36,7 +37,7 @@ GIT_BEGIN_DECL
  * @param repo the repository to look up the object
  * @param id the unique identifier for the object
  * @param type the type of the object
- * @return a reference to the object
+ * @return 0 or an error code
  */
 GIT_EXTERN(int) git_object_lookup(
 		git_object **object,
@@ -45,7 +46,7 @@ GIT_EXTERN(int) git_object_lookup(
 		git_otype type);
 
 /**
- * Lookup a reference to one of the objects in a repostory,
+ * Lookup a reference to one of the objects in a repository,
  * given a prefix of its identifier (short id).
  *
  * The object obtained will be so that its identifier
@@ -69,13 +70,30 @@ GIT_EXTERN(int) git_object_lookup(
  * @param id a short identifier for the object
  * @param len the length of the short identifier
  * @param type the type of the object
- * @return GIT_SUCCESS or an error code
+ * @return 0 or an error code
  */
 GIT_EXTERN(int) git_object_lookup_prefix(
 		git_object **object_out,
 		git_repository *repo,
 		const git_oid *id,
-		unsigned int len,
+		size_t len,
+		git_otype type);
+
+
+/**
+ * Lookup an object that represents a tree entry.
+ *
+ * @param out buffer that receives a pointer to the object (which must be freed
+ *            by the caller)
+ * @param treeish root object that can be peeled to a tree
+ * @param path relative path from the root object to the desired object
+ * @param type type of object desired
+ * @return 0 on success, or an error code
+ */
+GIT_EXTERN(int) git_object_lookup_bypath(
+		git_object **out,
+		const git_object *treeish,
+		const char *path,
 		git_otype type);
 
 /**
@@ -85,6 +103,20 @@ GIT_EXTERN(int) git_object_lookup_prefix(
  * @return the SHA1 id
  */
 GIT_EXTERN(const git_oid *) git_object_id(const git_object *obj);
+
+/**
+ * Get a short abbreviated OID string for the object
+ *
+ * This starts at the "core.abbrev" length (default 7 characters) and
+ * iteratively extends to a longer string if that length is ambiguous.
+ * The result will be unambiguous (at least until new objects are added to
+ * the repository).
+ *
+ * @param out Buffer to write string into
+ * @param obj The object to get an ID for
+ * @return 0 on success, <0 for error
+ */
+GIT_EXTERN(int) git_object_short_id(git_buf *out, const git_object *obj);
 
 /**
  * Get the object type of an object
@@ -114,7 +146,7 @@ GIT_EXTERN(git_repository *) git_object_owner(const git_object *obj);
  * This method instructs the library to close an existing
  * object; note that git_objects are owned and cached by the repository
  * so the object may or may not be freed after this library call,
- * depending on how agressive is the caching mechanism used
+ * depending on how aggressive is the caching mechanism used
  * by the repository.
  *
  * IMPORTANT:
@@ -126,7 +158,7 @@ GIT_EXTERN(git_repository *) git_object_owner(const git_object *obj);
 GIT_EXTERN(void) git_object_free(git_object *object);
 
 /**
- * Convert an object type to it's string representation.
+ * Convert an object type to its string representation.
  *
  * The result is a pointer to a string in static memory and
  * should not be free()'ed.
@@ -166,6 +198,36 @@ GIT_EXTERN(int) git_object_typeisloose(git_otype type);
  * @return size in bytes of the object
  */
 GIT_EXTERN(size_t) git_object__size(git_otype type);
+
+/**
+ * Recursively peel an object until an object of the specified type is met.
+ *
+ * The retrieved `peeled` object is owned by the repository and should be
+ * closed with the `git_object_free` method.
+ *
+ * If you pass `GIT_OBJ_ANY` as the target type, then the object will be
+ * peeled until the type changes (e.g. a tag will be chased until the
+ * referenced object is no longer a tag).
+ *
+ * @param peeled Pointer to the peeled git_object
+ * @param object The object to be processed
+ * @param target_type The type of the requested object (GIT_OBJ_COMMIT,
+ * GIT_OBJ_TAG, GIT_OBJ_TREE, GIT_OBJ_BLOB or GIT_OBJ_ANY).
+ * @return 0 on success, GIT_EAMBIGUOUS, GIT_ENOTFOUND or an error code
+ */
+GIT_EXTERN(int) git_object_peel(
+	git_object **peeled,
+	const git_object *object,
+	git_otype target_type);
+
+/**
+ * Create an in-memory copy of a Git object. The copy must be
+ * explicitly free'd or it will leak.
+ *
+ * @param dest Pointer to store the copy of the object
+ * @param source Original object to copy
+ */
+GIT_EXTERN(int) git_object_dup(git_object **dest, git_object *source);
 
 /** @} */
 GIT_END_DECL

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -20,41 +20,66 @@
 GIT_BEGIN_DECL
 
 /**
- * Create a new action signature. The signature must be freed
- * manually or using git_signature_free
+ * Create a new action signature.
  *
- * @param sig_out new signature, in case of error NULL
+ * Call `git_signature_free()` to free the data.
+ *
+ * Note: angle brackets ('<' and '>') characters are not allowed
+ * to be used in either the `name` or the `email` parameter.
+ *
+ * @param out new signature, in case of error NULL
  * @param name name of the person
  * @param email email of the person
  * @param time time when the action happened
  * @param offset timezone offset in minutes for the time
- * @return GIT_SUCCESS or an error code
+ * @return 0 or an error code
  */
-GIT_EXTERN(int) git_signature_new(git_signature **sig_out, const char *name, const char *email, git_time_t time, int offset);
+GIT_EXTERN(int) git_signature_new(git_signature **out, const char *name, const char *email, git_time_t time, int offset);
 
 /**
- * Create a new action signature with a timestamp of 'now'. The
- * signature must be freed manually or using git_signature_free
+ * Create a new action signature with a timestamp of 'now'.
  *
- * @param sig_out new signature, in case of error NULL
+ * Call `git_signature_free()` to free the data.
+ *
+ * @param out new signature, in case of error NULL
  * @param name name of the person
  * @param email email of the person
- * @return GIT_SUCCESS or an error code
+ * @return 0 or an error code
  */
-GIT_EXTERN(int) git_signature_now(git_signature **sig_out, const char *name, const char *email);
-
+GIT_EXTERN(int) git_signature_now(git_signature **out, const char *name, const char *email);
 
 /**
- * Create a copy of an existing signature.
+ * Create a new action signature with default user and now timestamp.
  *
- * All internal strings are also duplicated.
- * @param sig signature to duplicated
- * @return a copy of sig, NULL on out of memory
+ * This looks up the user.name and user.email from the configuration and
+ * uses the current time as the timestamp, and creates a new signature
+ * based on that information.  It will return GIT_ENOTFOUND if either the
+ * user.name or user.email are not set.
+ *
+ * @param out new signature
+ * @param repo repository pointer
+ * @return 0 on success, GIT_ENOTFOUND if config is missing, or error code
  */
-GIT_EXTERN(git_signature *) git_signature_dup(const git_signature *sig);
+GIT_EXTERN(int) git_signature_default(git_signature **out, git_repository *repo);
 
 /**
- * Free an existing signature
+ * Create a copy of an existing signature.  All internal strings are also
+ * duplicated.
+ *
+ * Call `git_signature_free()` to free the data.
+ *
+ * @param dest pointer where to store the copy
+ * @param sig signature to duplicate
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_signature_dup(git_signature **dest, const git_signature *sig);
+
+/**
+ * Free an existing signature.
+ *
+ * Because the signature is not an opaque structure, it is legal to free it
+ * manually, but be sure to free the "name" and "email" strings in addition
+ * to the structure itself.
  *
  * @param sig signature to free
  */

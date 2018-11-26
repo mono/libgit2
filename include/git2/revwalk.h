@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -63,11 +63,11 @@ GIT_BEGIN_DECL
  * it is possible to have several revision walkers in
  * several different threads walking the same repository.
  *
- * @param walker pointer to the new revision walker
+ * @param out pointer to the new revision walker
  * @param repo the repo to walk through
- * @return GIT_SUCCESS or an error code
+ * @return 0 or an error code
  */
-GIT_EXTERN(int) git_revwalk_new(git_revwalk **walker, git_repository *repo);
+GIT_EXTERN(int) git_revwalk_new(git_revwalk **out, git_repository *repo);
 
 /**
  * Reset the revision walker for reuse.
@@ -87,35 +87,109 @@ GIT_EXTERN(void) git_revwalk_reset(git_revwalk *walker);
 /**
  * Mark a commit to start traversal from.
  *
- * The given OID must belong to a commit on the walked
+ * The given OID must belong to a committish on the walked
  * repository.
  *
  * The given commit will be used as one of the roots
  * when starting the revision walk. At least one commit
- * must be pushed the repository before a walk can
+ * must be pushed onto the walker before a walk can
  * be started.
  *
  * @param walk the walker being used for the traversal.
- * @param oid the oid of the commit to start from.
- * @return GIT_SUCCESS or an error code
+ * @param id the oid of the commit to start from.
+ * @return 0 or an error code
  */
-GIT_EXTERN(int) git_revwalk_push(git_revwalk *walk, const git_oid *oid);
+GIT_EXTERN(int) git_revwalk_push(git_revwalk *walk, const git_oid *id);
 
+/**
+ * Push matching references
+ *
+ * The OIDs pointed to by the references that match the given glob
+ * pattern will be pushed to the revision walker.
+ *
+ * A leading 'refs/' is implied if not present as well as a trailing
+ * '/\*' if the glob lacks '?', '\*' or '['.
+ *
+ * Any references matching this glob which do not point to a
+ * committish will be ignored.
+ *
+ * @param walk the walker being used for the traversal
+ * @param glob the glob pattern references should match
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_revwalk_push_glob(git_revwalk *walk, const char *glob);
+
+/**
+ * Push the repository's HEAD
+ *
+ * @param walk the walker being used for the traversal
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_revwalk_push_head(git_revwalk *walk);
 
 /**
  * Mark a commit (and its ancestors) uninteresting for the output.
  *
- * The given OID must belong to a commit on the walked
+ * The given OID must belong to a committish on the walked
  * repository.
  *
  * The resolved commit and all its parents will be hidden from the
  * output on the revision walk.
  *
  * @param walk the walker being used for the traversal.
- * @param oid the oid of commit that will be ignored during the traversal
- * @return GIT_SUCCESS or an error code
+ * @param commit_id the oid of commit that will be ignored during the traversal
+ * @return 0 or an error code
  */
-GIT_EXTERN(int) git_revwalk_hide(git_revwalk *walk, const git_oid *oid);
+GIT_EXTERN(int) git_revwalk_hide(git_revwalk *walk, const git_oid *commit_id);
+
+/**
+ * Hide matching references.
+ *
+ * The OIDs pointed to by the references that match the given glob
+ * pattern and their ancestors will be hidden from the output on the
+ * revision walk.
+ *
+ * A leading 'refs/' is implied if not present as well as a trailing
+ * '/\*' if the glob lacks '?', '\*' or '['.
+ *
+ * Any references matching this glob which do not point to a
+ * committish will be ignored.
+ *
+ * @param walk the walker being used for the traversal
+ * @param glob the glob pattern references should match
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_revwalk_hide_glob(git_revwalk *walk, const char *glob);
+
+/**
+ * Hide the repository's HEAD
+ *
+ * @param walk the walker being used for the traversal
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_revwalk_hide_head(git_revwalk *walk);
+
+/**
+ * Push the OID pointed to by a reference
+ *
+ * The reference must point to a committish.
+ *
+ * @param walk the walker being used for the traversal
+ * @param refname the reference to push
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_revwalk_push_ref(git_revwalk *walk, const char *refname);
+
+/**
+ * Hide the OID pointed to by a reference
+ *
+ * The reference must point to a committish.
+ *
+ * @param walk the walker being used for the traversal
+ * @param refname the reference to hide
+ * @return 0 or an error code
+ */
+GIT_EXTERN(int) git_revwalk_hide_ref(git_revwalk *walk, const char *refname);
 
 /**
  * Get the next commit from the revision walk.
@@ -130,12 +204,12 @@ GIT_EXTERN(int) git_revwalk_hide(git_revwalk *walk, const git_oid *oid);
  *
  * The revision walker is reset when the walk is over.
  *
- * @param oid Pointer where to store the oid of the next commit
+ * @param out Pointer where to store the oid of the next commit
  * @param walk the walker to pop the commit from.
- * @return GIT_SUCCESS if the next commit was found;
- *	GIT_EREVWALKOVER if there are no commits left to iterate
+ * @return 0 if the next commit was found;
+ *	GIT_ITEROVER if there are no commits left to iterate
  */
-GIT_EXTERN(int) git_revwalk_next(git_oid *oid, git_revwalk *walk);
+GIT_EXTERN(int) git_revwalk_next(git_oid *out, git_revwalk *walk);
 
 /**
  * Change the sorting mode when iterating through the
@@ -147,6 +221,29 @@ GIT_EXTERN(int) git_revwalk_next(git_oid *oid, git_revwalk *walk);
  * @param sort_mode combination of GIT_SORT_XXX flags
  */
 GIT_EXTERN(void) git_revwalk_sorting(git_revwalk *walk, unsigned int sort_mode);
+
+/**
+ * Push and hide the respective endpoints of the given range.
+ *
+ * The range should be of the form
+ *   <commit>..<commit>
+ * where each <commit> is in the form accepted by 'git_revparse_single'.
+ * The left-hand commit will be hidden and the right-hand commit pushed.
+ *
+ * @param walk the walker being used for the traversal
+ * @param range the range
+ * @return 0 or an error code
+ *
+ */
+GIT_EXTERN(int) git_revwalk_push_range(git_revwalk *walk, const char *range);
+
+/**
+ * Simplify the history by first-parent
+ *
+ * No parents other than the first for each commit will be enqueued.
+ */
+GIT_EXTERN(void) git_revwalk_simplify_first_parent(git_revwalk *walk);
+
 
 /**
  * Free a revision walker previously allocated.
@@ -163,6 +260,30 @@ GIT_EXTERN(void) git_revwalk_free(git_revwalk *walk);
  * @return the repository being walked
  */
 GIT_EXTERN(git_repository *) git_revwalk_repository(git_revwalk *walk);
+
+/**
+ * This is a callback function that user can provide to hide a
+ * commit and its parents. If the callback function returns non-zero value,
+ * then this commit and its parents will be hidden.
+ *
+ * @param commit_id oid of Commit
+ * @param payload User-specified pointer to data to be passed as data payload
+ */
+typedef int(*git_revwalk_hide_cb)(
+	const git_oid *commit_id,
+	void *payload);
+
+/**
+ * Adds a callback function to hide a commit and its parents
+ *
+ * @param walk the revision walker
+ * @param hide_cb  callback function to hide a commit and its parents
+ * @param payload  data payload to be passed to callback function
+ */
+GIT_EXTERN(int) git_revwalk_add_hide_cb(
+	git_revwalk *walk,
+	git_revwalk_hide_cb hide_cb,
+	void *payload);
 
 /** @} */
 GIT_END_DECL

@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "common.h"
 
@@ -12,11 +13,12 @@ struct {
 } commands[] = {
 	{"ls-remote", ls_remote},
 	{"fetch", fetch},
+	{"clone", do_clone},
 	{"index-pack", index_pack},
 	{ NULL, NULL}
 };
 
-int run_command(git_cb fn, int argc, char **argv)
+static int run_command(git_cb fn, int argc, char **argv)
 {
 	int error;
 	git_repository *repo;
@@ -25,13 +27,17 @@ int run_command(git_cb fn, int argc, char **argv)
 // repository and pass it to the function.
 
 	error = git_repository_open(&repo, ".git");
-	if (error < GIT_SUCCESS)
+	if (error < 0)
 		repo = NULL;
 
 	// Run the command. If something goes wrong, print the error message to stderr
 	error = fn(repo, argc, argv);
-	if (error < GIT_SUCCESS)
-		fprintf(stderr, "Bad news:\n %s\n", git_lasterror());
+	if (error < 0) {
+		if (giterr_last() == NULL)
+			fprintf(stderr, "Error without message");
+		else
+			fprintf(stderr, "Bad news:\n %s\n", giterr_last()->message);
+	}
 
 	if(repo)
 		git_repository_free(repo);
@@ -41,12 +47,14 @@ int run_command(git_cb fn, int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	int i, error;
+	int i;
 
 	if (argc < 2) {
 		fprintf(stderr, "usage: %s <cmd> [repo]\n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
+
+	git_threads_init();
 
 	for (i = 0; commands[i].name != NULL; ++i) {
 		if (!strcmp(argv[1], commands[i].name))

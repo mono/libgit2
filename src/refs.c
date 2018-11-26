@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -9,1553 +9,764 @@
 #include "hash.h"
 #include "repository.h"
 #include "fileops.h"
+#include "filebuf.h"
 #include "pack.h"
 #include "reflog.h"
+#include "refdb.h"
 
 #include <git2/tag.h>
 #include <git2/object.h>
+#include <git2/oid.h>
+#include <git2/branch.h>
+#include <git2/refs.h>
+#include <git2/refdb.h>
+#include <git2/sys/refs.h>
+#include <git2/signature.h>
 
-#define MAX_NESTING_LEVEL 5
+GIT__USE_STRMAP;
+
+#define DEFAULT_NESTING_LEVEL	5
+#define MAX_NESTING_LEVEL		10
 
 enum {
 	GIT_PACKREF_HAS_PEEL = 1,
 	GIT_PACKREF_WAS_LOOSE = 2
 };
 
-struct packref {
-	git_oid oid;
-	git_oid peel;
-	char flags;
-	char name[GIT_FLEX_ARRAY];
-};
+static git_reference *alloc_ref(const char *name)
+{
+	git_reference *ref;
+	size_t namelen = strlen(name);
 
-static const int default_table_size = 32;
+	if ((ref = git__calloc(1, sizeof(git_reference) + namelen + 1)) == NULL)
+		return NULL;
 
-static int reference_read(
-	git_fbuffer *file_content,
-	time_t *mtime,
-	const char *repo_path,
-	const char *ref_name,
-	int *updated);
+	memcpy(ref->name, name, namelen + 1);
 
-/* loose refs */
-static int loose_parse_symbolic(git_reference *ref, git_fbuffer *file_content);
-static int loose_parse_oid(git_oid *ref, git_fbuffer *file_content);
-static int loose_lookup(git_reference *ref);
-static int loose_lookup_to_packfile(struct packref **ref_out,
-	git_repository *repo, const char *name);
-static int loose_write(git_reference *ref);
+	return ref;
+}
 
-/* packed refs */
-static int packed_parse_peel(struct packref *tag_ref,
-	const char **buffer_out, const char *buffer_end);
-static int packed_parse_oid(struct packref **ref_out,
-	const char **buffer_out, const char *buffer_end);
-static int packed_load(git_repository *repo);
-static int packed_loadloose(git_repository *repository);
-static int packed_write_ref(struct packref *ref, git_filebuf *file);
-static int packed_find_peel(git_repository *repo, struct packref *ref);
-static int packed_remove_loose(git_repository *repo, git_vector *packing_list);
-static int packed_sort(const void *a, const void *b);
-static int packed_lookup(git_reference *ref);
-static int packed_write(git_repository *repo);
+git_reference *git_reference__alloc_symbolic(
+	const char *name, const char *target)
+{
+	git_reference *ref;
 
-/* internal helpers */
-static int reference_available(git_repository *repo,
-	const char *ref, const char *old_ref);
-static int reference_delete(git_reference *ref);
-static int reference_lookup(git_reference *ref);
+	assert(name && target);
 
-/* name normalization */
-static int normalize_name(char *buffer_out, size_t out_size,
-	const char *name, int is_oid_ref);
+	ref = alloc_ref(name);
+	if (!ref)
+		return NULL;
 
+	ref->type = GIT_REF_SYMBOLIC;
+
+	if ((ref->target.symbolic = git__strdup(target)) == NULL) {
+		git__free(ref);
+		return NULL;
+	}
+
+	return ref;
+}
+
+git_reference *git_reference__alloc(
+	const char *name,
+	const git_oid *oid,
+	const git_oid *peel)
+{
+	git_reference *ref;
+
+	assert(name && oid);
+
+	ref = alloc_ref(name);
+	if (!ref)
+		return NULL;
+
+	ref->type = GIT_REF_OID;
+	git_oid_cpy(&ref->target.oid, oid);
+
+	if (peel != NULL)
+		git_oid_cpy(&ref->peel, peel);
+
+	return ref;
+}
+
+git_reference *git_reference__set_name(
+	git_reference *ref, const char *name)
+{
+	size_t namelen = strlen(name);
+	git_reference *rewrite =
+		git__realloc(ref, sizeof(git_reference) + namelen + 1);
+	if (rewrite != NULL)
+		memcpy(rewrite->name, name, namelen + 1);
+	return rewrite;
+}
 
 void git_reference_free(git_reference *reference)
 {
 	if (reference == NULL)
 		return;
 
-	git__free(reference->name);
-	reference->name = NULL;
-
-	if (reference->flags & GIT_REF_SYMBOLIC) {
+	if (reference->type == GIT_REF_SYMBOLIC)
 		git__free(reference->target.symbolic);
-		reference->target.symbolic = NULL;
-	}
+
+	if (reference->db)
+		GIT_REFCOUNT_DEC(reference->db, git_refdb__free);
 
 	git__free(reference);
 }
 
-static int reference_alloc(
-	git_reference **ref_out,
-	git_repository *repo,
-	const char *name)
-{
-	git_reference *reference = NULL;
-
-	assert(ref_out && repo && name);
-
-	reference = git__malloc(sizeof(git_reference));
-	if (reference == NULL)
-		return GIT_ENOMEM;
-
-	memset(reference, 0x0, sizeof(git_reference));
-	reference->owner = repo;
-
-	reference->name = git__strdup(name);
-	if (reference->name == NULL) {
-		free(reference);
-		return GIT_ENOMEM;
-	}
-
-	*ref_out = reference;
-	return GIT_SUCCESS;
-}
-
-static int reference_read(git_fbuffer *file_content, time_t *mtime, const char *repo_path, const char *ref_name, int *updated)
-{
-	git_buf path = GIT_BUF_INIT;
-	int     error = GIT_SUCCESS;
-
-	assert(file_content && repo_path && ref_name);
-
-	/* Determine the full path of the file */
-	if ((error = git_buf_joinpath(&path, repo_path, ref_name)) == GIT_SUCCESS)
-		error = git_futils_readbuffer_updated(file_content, path.ptr, mtime, updated);
-
-	git_buf_free(&path);
-
-	return error;
-}
-
-static int loose_parse_symbolic(git_reference *ref, git_fbuffer *file_content)
-{
-	const unsigned int header_len = strlen(GIT_SYMREF);
-	const char *refname_start;
-	char *eol;
-
-	refname_start = (const char *)file_content->data;
-
-	if (file_content->len < (header_len + 1))
-		return git__throw(GIT_EOBJCORRUPTED,
-			"Failed to parse loose reference. Object too short");
-
-	/*
-	 * Assume we have already checked for the header
-	 * before calling this function
-	 */
-
-	refname_start += header_len;
-
-	ref->target.symbolic = git__strdup(refname_start);
-	if (ref->target.symbolic == NULL)
-		return GIT_ENOMEM;
-
-	/* remove newline at the end of file */
-	eol = strchr(ref->target.symbolic, '\n');
-	if (eol == NULL)
-		return git__throw(GIT_EOBJCORRUPTED,
-			"Failed to parse loose reference. Missing EOL");
-
-	*eol = '\0';
-	if (eol[-1] == '\r')
-		eol[-1] = '\0';
-
-	return GIT_SUCCESS;
-}
-
-static int loose_parse_oid(git_oid *oid, git_fbuffer *file_content)
-{
-	int error;
-	char *buffer;
-
-	buffer = (char *)file_content->data;
-
-	/* File format: 40 chars (OID) + newline */
-	if (file_content->len < GIT_OID_HEXSZ + 1)
-		return git__throw(GIT_EOBJCORRUPTED,
-			"Failed to parse loose reference. Reference too short");
-
-	if ((error = git_oid_fromstr(oid, buffer)) < GIT_SUCCESS)
-		return git__rethrow(GIT_EOBJCORRUPTED, "Failed to parse loose reference.");
-
-	buffer = buffer + GIT_OID_HEXSZ;
-	if (*buffer == '\r')
-		buffer++;
-
-	if (*buffer != '\n')
-		return git__throw(GIT_EOBJCORRUPTED,
-			"Failed to parse loose reference. Missing EOL");
-
-	return GIT_SUCCESS;
-}
-
-static git_rtype loose_guess_rtype(const git_buf *full_path)
-{
-	git_fbuffer ref_file = GIT_FBUFFER_INIT;
-	git_rtype type;
-
-	type = GIT_REF_INVALID;
-
-	if (git_futils_readbuffer(&ref_file, full_path->ptr) == GIT_SUCCESS) {
-		if (git__prefixcmp((const char *)(ref_file.data), GIT_SYMREF) == 0)
-			type = GIT_REF_SYMBOLIC;
-		else
-			type = GIT_REF_OID;
-	}
-
-	git_futils_freebuffer(&ref_file);
-	return type;
-}
-
-static int loose_lookup(git_reference *ref)
-{
-	int error = GIT_SUCCESS, updated;
-	git_fbuffer ref_file = GIT_FBUFFER_INIT;
-
-	if (reference_read(&ref_file, &ref->mtime,
-			ref->owner->path_repository, ref->name, &updated) < GIT_SUCCESS)
-		return git__throw(GIT_ENOTFOUND, "Failed to lookup loose reference");
-
-	if (!updated)
-		return GIT_SUCCESS;
-
-	if (ref->flags & GIT_REF_SYMBOLIC) {
-		free(ref->target.symbolic);
-		ref->target.symbolic = NULL;
-	}
-
-	ref->flags = 0;
-
-	if (git__prefixcmp((const char *)(ref_file.data), GIT_SYMREF) == 0) {
-		ref->flags |= GIT_REF_SYMBOLIC;
-		error = loose_parse_symbolic(ref, &ref_file);
-	} else {
-		ref->flags |= GIT_REF_OID;
-		error = loose_parse_oid(&ref->target.oid, &ref_file);
-	}
-
-	git_futils_freebuffer(&ref_file);
-
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to lookup loose reference");
-
-	return GIT_SUCCESS;
-}
-
-static int loose_lookup_to_packfile(
-		struct packref **ref_out,
-		git_repository *repo,
-		const char *name)
-{
-	int error = GIT_SUCCESS;
-	git_fbuffer ref_file = GIT_FBUFFER_INIT;
-	struct packref *ref = NULL;
-	size_t name_len;
-
-	*ref_out = NULL;
-
-	error = reference_read(&ref_file, NULL, repo->path_repository, name, NULL);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	name_len = strlen(name);
-	ref = git__malloc(sizeof(struct packref) + name_len + 1);
-
-	memcpy(ref->name, name, name_len);
-	ref->name[name_len] = 0;
-
-	error = loose_parse_oid(&ref->oid, &ref_file);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	ref->flags = GIT_PACKREF_WAS_LOOSE;
-
-	*ref_out = ref;
-	git_futils_freebuffer(&ref_file);
-	return GIT_SUCCESS;
-
-cleanup:
-	git_futils_freebuffer(&ref_file);
-	free(ref);
-	return git__rethrow(error, "Failed to lookup loose reference");
-}
-
-static int loose_write(git_reference *ref)
-{
-	git_filebuf file = GIT_FILEBUF_INIT;
-	git_buf ref_path = GIT_BUF_INIT;
-	int error;
-	struct stat st;
-
-	error = git_buf_joinpath(&ref_path, ref->owner->path_repository, ref->name);
-	if (error < GIT_SUCCESS)
-		goto unlock;
-
-	error = git_filebuf_open(&file, ref_path.ptr, GIT_FILEBUF_FORCE);
-	if (error < GIT_SUCCESS)
-		goto unlock;
-
-	if (ref->flags & GIT_REF_OID) {
-		char oid[GIT_OID_HEXSZ + 1];
-
-		git_oid_fmt(oid, &ref->target.oid);
-		oid[GIT_OID_HEXSZ] = '\0';
-
-		error = git_filebuf_printf(&file, "%s\n", oid);
-		if (error < GIT_SUCCESS)
-			goto unlock;
-
-	} else if (ref->flags & GIT_REF_SYMBOLIC) { /* GIT_REF_SYMBOLIC */
-		error = git_filebuf_printf(&file, GIT_SYMREF "%s\n", ref->target.symbolic);
-	} else {
-		error = git__throw(GIT_EOBJCORRUPTED,
-			"Failed to write reference. Invalid reference type");
-		goto unlock;
-	}
-
-	if (p_stat(ref_path.ptr, &st) == GIT_SUCCESS)
-		ref->mtime = st.st_mtime;
-
-	git_buf_free(&ref_path);
-
-	return git_filebuf_commit(&file, GIT_REFS_FILE_MODE);
-
-unlock:
-	git_buf_free(&ref_path);
-	git_filebuf_cleanup(&file);
-	return git__rethrow(error, "Failed to write loose reference");
-}
-
-static int packed_parse_peel(
-		struct packref *tag_ref,
-		const char **buffer_out,
-		const char *buffer_end)
-{
-	const char *buffer = *buffer_out + 1;
-
-	assert(buffer[-1] == '^');
-
-	/* Ensure it's not the first entry of the file */
-	if (tag_ref == NULL)
-		return git__throw(GIT_EPACKEDREFSCORRUPTED,
-			"Failed to parse packed reference. "
-			"Reference is the first entry of the file");
-
-	/* Ensure reference is a tag */
-	if (git__prefixcmp(tag_ref->name, GIT_REFS_TAGS_DIR) != 0)
-		return git__throw(GIT_EPACKEDREFSCORRUPTED,
-			"Failed to parse packed reference. Reference is not a tag");
-
-	if (buffer + GIT_OID_HEXSZ >= buffer_end)
-		return git__throw(GIT_EPACKEDREFSCORRUPTED,
-			"Failed to parse packed reference. Buffer too small");
-
-	/* Is this a valid object id? */
-	if (git_oid_fromstr(&tag_ref->peel, buffer) < GIT_SUCCESS)
-		return git__throw(GIT_EPACKEDREFSCORRUPTED,
-			"Failed to parse packed reference. Not a valid object ID");
-
-	buffer = buffer + GIT_OID_HEXSZ;
-	if (*buffer == '\r')
-		buffer++;
-
-	if (*buffer != '\n')
-		return git__throw(GIT_EPACKEDREFSCORRUPTED,
-			"Failed to parse packed reference. Buffer not terminated correctly");
-
-	*buffer_out = buffer + 1;
-	return GIT_SUCCESS;
-}
-
-static int packed_parse_oid(
-		struct packref **ref_out,
-		const char **buffer_out,
-		const char *buffer_end)
-{
-	struct packref *ref = NULL;
-
-	const char *buffer = *buffer_out;
-	const char *refname_begin, *refname_end;
-
-	int error = GIT_SUCCESS;
-	size_t refname_len;
-	git_oid id;
-
-	refname_begin = (buffer + GIT_OID_HEXSZ + 1);
-	if (refname_begin >= buffer_end ||
-		refname_begin[-1] != ' ') {
-		error = GIT_EPACKEDREFSCORRUPTED;
-		goto cleanup;
-	}
-
-	/* Is this a valid object id? */
-	if ((error = git_oid_fromstr(&id, buffer)) < GIT_SUCCESS)
-		goto cleanup;
-
-	refname_end = memchr(refname_begin, '\n', buffer_end - refname_begin);
-	if (refname_end == NULL) {
-		error = GIT_EPACKEDREFSCORRUPTED;
-		goto cleanup;
-	}
-
-	if (refname_end[-1] == '\r')
-		refname_end--;
-
-	refname_len = refname_end - refname_begin;
-
-	ref = git__malloc(sizeof(struct packref) + refname_len + 1);
-
-	memcpy(ref->name, refname_begin, refname_len);
-	ref->name[refname_len] = 0;
-
-	git_oid_cpy(&ref->oid, &id);
-
-	ref->flags = 0;
-
-	*ref_out = ref;
-	*buffer_out = refname_end + 1;
-
-	return GIT_SUCCESS;
-
-cleanup:
-	free(ref);
-	return git__rethrow(error, "Failed to parse OID of packed reference");
-}
-
-static int packed_load(git_repository *repo)
-{
-	int error = GIT_SUCCESS, updated;
-	git_fbuffer packfile = GIT_FBUFFER_INIT;
-	const char *buffer_start, *buffer_end;
-	git_refcache *ref_cache = &repo->references;
-
-	/* First we make sure we have allocated the hash table */
-	if (ref_cache->packfile == NULL) {
-		ref_cache->packfile = git_hashtable_alloc(
-			default_table_size, git_hash__strhash_cb, git_hash__strcmp_cb);
-
-		if (ref_cache->packfile == NULL) {
-			error = GIT_ENOMEM;
-			goto cleanup;
-		}
-	}
-
-	error = reference_read(&packfile, &ref_cache->packfile_time,
-		repo->path_repository, GIT_PACKEDREFS_FILE, &updated);
-
-	/*
-	 * If we couldn't find the file, we need to clear the table and
-	 * return. On any other error, we return that error. If everything
-	 * went fine and the file wasn't updated, then there's nothing new
-	 * for us here, so just return. Anything else means we need to
-	 * refresh the packed refs.
-	 */
-	if (error == GIT_ENOTFOUND) {
-		git_hashtable_clear(ref_cache->packfile);
-		return GIT_SUCCESS;
-	} else if (error < GIT_SUCCESS) {
-		return git__rethrow(error, "Failed to read packed refs");
-	} else if (!updated) {
-		return GIT_SUCCESS;
-	}
-
-	/*
-	 * At this point, we want to refresh the packed refs. We already
-	 * have the contents in our buffer.
-	 */
-
-	git_hashtable_clear(ref_cache->packfile);
-
-	buffer_start = (const char *)packfile.data;
-	buffer_end = (const char *)(buffer_start) + packfile.len;
-
-	while (buffer_start < buffer_end && buffer_start[0] == '#') {
-		buffer_start = strchr(buffer_start, '\n');
-		if (buffer_start == NULL) {
-			error = GIT_EPACKEDREFSCORRUPTED;
-			goto cleanup;
-		}
-		buffer_start++;
-	}
-
-	while (buffer_start < buffer_end) {
-		struct packref *ref = NULL;
-
-		error = packed_parse_oid(&ref, &buffer_start, buffer_end);
-		if (error < GIT_SUCCESS)
-			goto cleanup;
-
-		if (buffer_start[0] == '^') {
-			error = packed_parse_peel(ref, &buffer_start, buffer_end);
-			if (error < GIT_SUCCESS)
-				goto cleanup;
-		}
-
-		error = git_hashtable_insert(ref_cache->packfile, ref->name, ref);
-		if (error < GIT_SUCCESS) {
-			free(ref);
-			goto cleanup;
-		}
-	}
-
-	git_futils_freebuffer(&packfile);
-	return GIT_SUCCESS;
-
-cleanup:
-	git_hashtable_free(ref_cache->packfile);
-	ref_cache->packfile = NULL;
-	git_futils_freebuffer(&packfile);
-	return git__rethrow(error, "Failed to load packed references");
-}
-
-
-struct dirent_list_data {
-	git_repository *repo;
-	size_t repo_path_len;
-	unsigned int list_flags;
-
-	int (*callback)(const char *, void *);
-	void *callback_payload;
-};
-
-static int _dirent_loose_listall(void *_data, git_buf *full_path)
-{
-	struct dirent_list_data *data = (struct dirent_list_data *)_data;
-	const char *file_path = full_path->ptr + data->repo_path_len;
-
-	if (git_path_isdir(full_path->ptr) == GIT_SUCCESS)
-		return git_path_direach(full_path, _dirent_loose_listall, _data);
-
-	/* do not add twice a reference that exists already in the packfile */
-	if ((data->list_flags & GIT_REF_PACKED) != 0 &&
-		git_hashtable_lookup(data->repo->references.packfile, file_path) != NULL)
-		return GIT_SUCCESS;
-
-	if (data->list_flags != GIT_REF_LISTALL) {
-		if ((data->list_flags & loose_guess_rtype(full_path)) == 0)
-			return GIT_SUCCESS; /* we are filtering out this reference */
-	}
-
-	return data->callback(file_path, data->callback_payload);
-}
-
-static int _dirent_loose_load(void *data, git_buf *full_path)
-{
-	git_repository *repository = (git_repository *)data;
-	void *old_ref = NULL;
-	struct packref *ref;
-	const char *file_path;
-	int error;
-
-	if (git_path_isdir(full_path->ptr) == GIT_SUCCESS)
-		return git_path_direach(full_path, _dirent_loose_load, repository);
-
-	file_path = full_path->ptr + strlen(repository->path_repository);
-	error = loose_lookup_to_packfile(&ref, repository, file_path);
-
-	if (error == GIT_SUCCESS) {
-
-		if (git_hashtable_insert2(
-			repository->references.packfile,
-			ref->name, ref, &old_ref) < GIT_SUCCESS) {
-			free(ref);
-			return GIT_ENOMEM;
-		}
-
-		if (old_ref != NULL)
-			free(old_ref);
-	}
-
-	return error == GIT_SUCCESS ?
-		GIT_SUCCESS :
-		git__rethrow(error, "Failed to load loose references into packfile");
-}
-
-/*
- * Load all the loose references from the repository
- * into the in-memory Packfile, and build a vector with
- * all the references so it can be written back to
- * disk.
- */
-static int packed_loadloose(git_repository *repository)
-{
-	int error = GIT_SUCCESS;
-	git_buf refs_path = GIT_BUF_INIT;
-
-	/* the packfile must have been previously loaded! */
-	assert(repository->references.packfile);
-
-	if ((error = git_buf_joinpath(&refs_path,
-		repository->path_repository, GIT_REFS_DIR)) < GIT_SUCCESS)
-		return error;
-
-	/*
-	 * Load all the loose files from disk into the Packfile table.
-	 * This will overwrite any old packed entries with their
-	 * updated loose versions
-	 */
-	error = git_path_direach(&refs_path, _dirent_loose_load, repository);
-	git_buf_free(&refs_path);
-	return error;
-}
-
-/*
- * Write a single reference into a packfile
- */
-static int packed_write_ref(struct packref *ref, git_filebuf *file)
-{
-	int error;
-	char oid[GIT_OID_HEXSZ + 1];
-
-	git_oid_fmt(oid, &ref->oid);
-	oid[GIT_OID_HEXSZ] = 0;
-
-	/*
-	 * For references that peel to an object in the repo, we must
-	 * write the resulting peel on a separate line, e.g.
-	 *
-	 *	6fa8a902cc1d18527e1355773c86721945475d37 refs/tags/libgit2-0.4
-	 *	^2ec0cb7959b0bf965d54f95453f5b4b34e8d3100
-	 *
-	 * This obviously only applies to tags.
-	 * The required peels have already been loaded into `ref->peel_target`.
-	 */
-	if (ref->flags & GIT_PACKREF_HAS_PEEL) {
-		char peel[GIT_OID_HEXSZ + 1];
-		git_oid_fmt(peel, &ref->peel);
-		peel[GIT_OID_HEXSZ] = 0;
-
-		error = git_filebuf_printf(file, "%s %s\n^%s\n", oid, ref->name, peel);
-	} else {
-		error = git_filebuf_printf(file, "%s %s\n", oid, ref->name);
-	}
-
-	return error == GIT_SUCCESS ?
-		GIT_SUCCESS :
-		git__rethrow(error, "Failed to write packed reference");
-}
-
-/*
- * Find out what object this reference resolves to.
- *
- * For references that point to a 'big' tag (e.g. an
- * actual tag object on the repository), we need to
- * cache on the packfile the OID of the object to
- * which that 'big tag' is pointing to.
- */
-static int packed_find_peel(git_repository *repo, struct packref *ref)
-{
-	git_object *object;
-	int error;
-
-	if (ref->flags & GIT_PACKREF_HAS_PEEL)
-		return GIT_SUCCESS;
-
-	/*
-	 * Only applies to tags, i.e. references
-	 * in the /refs/tags folder
-	 */
-	if (git__prefixcmp(ref->name, GIT_REFS_TAGS_DIR) != 0)
-		return GIT_SUCCESS;
-
-	/*
-	 * Find the tagged object in the repository
-	 */
-	error = git_object_lookup(&object, repo, &ref->oid, GIT_OBJ_ANY);
-	if (error < GIT_SUCCESS)
-		return git__throw(GIT_EOBJCORRUPTED, "Failed to find packed reference");
-
-	/*
-	 * If the tagged object is a Tag object, we need to resolve it;
-	 * if the ref is actually a 'weak' ref, we don't need to resolve
-	 * anything.
-	 */
-	if (git_object_type(object) == GIT_OBJ_TAG) {
-		git_tag *tag = (git_tag *)object;
-
-		/*
-		 * Find the object pointed at by this tag
-		 */
-		git_oid_cpy(&ref->peel, git_tag_target_oid(tag));
-		ref->flags |= GIT_PACKREF_HAS_PEEL;
-
-		/*
-		 * The reference has now cached the resolved OID, and is
-		 * marked at such. When written to the packfile, it'll be
-		 * accompanied by this resolved oid
-		 */
-	}
-
-	git_object_free(object);
-	return GIT_SUCCESS;
-}
-
-/*
- * Remove all loose references
- *
- * Once we have successfully written a packfile,
- * all the loose references that were packed must be
- * removed from disk.
- *
- * This is a dangerous method; make sure the packfile
- * is well-written, because we are destructing references
- * here otherwise.
- */
-static int packed_remove_loose(git_repository *repo, git_vector *packing_list)
-{
-	unsigned int i;
-	git_buf full_path = GIT_BUF_INIT;
-	int error = GIT_SUCCESS;
-
-	for (i = 0; i < packing_list->length; ++i) {
-		struct packref *ref = git_vector_get(packing_list, i);
-		int an_error;
-
-		if ((ref->flags & GIT_PACKREF_WAS_LOOSE) == 0)
-			continue;
-
-		an_error = git_buf_joinpath(&full_path, repo->path_repository, ref->name);
-
-		if (an_error == GIT_SUCCESS &&
-			git_path_exists(full_path.ptr) == GIT_SUCCESS &&
-			p_unlink(full_path.ptr) < GIT_SUCCESS)
-			an_error = GIT_EOSERR;
-
-		/* keep the error if we haven't seen one yet */
-		if (error > an_error)
-			error = an_error;
-
-		/*
-		 * if we fail to remove a single file, this is *not* good,
-		 * but we should keep going and remove as many as possible.
-		 * After we've removed as many files as possible, we return
-		 * the error code anyway.
-		 */
-	}
-
-	git_buf_free(&full_path);
-
-	return error == GIT_SUCCESS ?
-		GIT_SUCCESS :
-		git__rethrow(error, "Failed to remove loose packed reference");
-}
-
-static int packed_sort(const void *a, const void *b)
-{
-	const struct packref *ref_a = (const struct packref *)a;
-	const struct packref *ref_b = (const struct packref *)b;
-
-	return strcmp(ref_a->name, ref_b->name);
-}
-
-/*
- * Write all the contents in the in-memory packfile to disk.
- */
-static int packed_write(git_repository *repo)
-{
-	git_filebuf pack_file = GIT_FILEBUF_INIT;
-	int error;
-	const char *errmsg = "Failed to write packed references file";
-	unsigned int i;
-	git_buf pack_file_path = GIT_BUF_INIT;
-	git_vector packing_list;
-	size_t total_refs;
-
-	assert(repo && repo->references.packfile);
-
-	total_refs = repo->references.packfile->key_count;
-	if ((error =
-		git_vector_init(&packing_list, total_refs, packed_sort)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to init packed references list");
-
-	/* Load all the packfile into a vector */
-	{
-		struct packref *reference;
-		const void *GIT_UNUSED(_unused);
-
-		GIT_HASHTABLE_FOREACH(repo->references.packfile, _unused, reference,
-			/* cannot fail: vector already has the right size */
-			git_vector_insert(&packing_list, reference);
-		);
-	}
-
-	/* sort the vector so the entries appear sorted on the packfile */
-	git_vector_sort(&packing_list);
-
-	/* Now we can open the file! */
-	error = git_buf_joinpath(&pack_file_path, repo->path_repository, GIT_PACKEDREFS_FILE);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	if ((error = git_filebuf_open(&pack_file, pack_file_path.ptr, 0)) < GIT_SUCCESS) {
-		errmsg = "Failed to open packed references file";
-		goto cleanup;
-	}
-
-	/* Packfiles have a header... apparently
-	 * This is in fact not required, but we might as well print it
-	 * just for kicks */
-	if ((error =
-		 git_filebuf_printf(&pack_file, "%s\n", GIT_PACKEDREFS_HEADER)) < GIT_SUCCESS) {
-		errmsg = "Failed to write packed references file header";
-		goto cleanup;
-	}
-
-	for (i = 0; i < packing_list.length; ++i) {
-		struct packref *ref = (struct packref *)git_vector_get(&packing_list, i);
-
-		if ((error = packed_find_peel(repo, ref)) < GIT_SUCCESS) {
-			error = git__throw(GIT_EOBJCORRUPTED,
-				"A reference cannot be peeled");
-			goto cleanup;
-		}
-
-		if ((error = packed_write_ref(ref, &pack_file)) < GIT_SUCCESS)
-			goto cleanup;
-	}
-
-cleanup:
-	/* if we've written all the references properly, we can commit
-	 * the packfile to make the changes effective */
-	if (error == GIT_SUCCESS) {
-		error = git_filebuf_commit(&pack_file, GIT_PACKEDREFS_FILE_MODE);
-
-		/* when and only when the packfile has been properly written,
-		 * we can go ahead and remove the loose refs */
-		if (error == GIT_SUCCESS) {
-			struct stat st;
-
-			error = packed_remove_loose(repo, &packing_list);
-
-			if (p_stat(pack_file_path.ptr, &st) == GIT_SUCCESS)
-				repo->references.packfile_time = st.st_mtime;
-		}
-	}
-	else git_filebuf_cleanup(&pack_file);
-
-	git_vector_free(&packing_list);
-	git_buf_free(&pack_file_path);
-
-	if (error < GIT_SUCCESS)
-		git__rethrow(error, "%s", errmsg);
-
-	return error;
-}
-
-static int _reference_available_cb(const char *ref, void *data)
-{
-	const char *new, *old;
-	const char **refs;
-
-	assert(ref && data);
-
-	refs = (const char **)data;
-
-	new = (const char *)refs[0];
-	old = (const char *)refs[1];
-
-	if (!old || strcmp(old, ref)) {
-		int reflen = strlen(ref);
-		int newlen = strlen(new);
-		int cmplen = reflen < newlen ? reflen : newlen;
-		const char *lead = reflen < newlen ? new : ref;
-
-		if (!strncmp(new, ref, cmplen) &&
-			lead[cmplen] == '/')
-			return GIT_EEXISTS;
-	}
-
-	return GIT_SUCCESS;
-}
-
-static int reference_available(
-	git_repository *repo,
-	const char *ref,
-	const char* old_ref)
-{
-	const char *refs[2];
-
-	refs[0] = ref;
-	refs[1] = old_ref;
-
-	if (git_reference_foreach(repo, GIT_REF_LISTALL,
-		_reference_available_cb, (void *)refs) < 0) {
-		return git__throw(GIT_EEXISTS,
-			"Reference name `%s` conflicts with existing reference", ref);
-	}
-
-	return GIT_SUCCESS;
-}
-
-static int reference_exists(int *exists, git_repository *repo, const char *ref_name)
-{
-	int error;
-	git_buf ref_path = GIT_BUF_INIT;
-
-	error = packed_load(repo);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Cannot resolve if a reference exists");
-
-	error = git_buf_joinpath(&ref_path, repo->path_repository, ref_name);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Cannot resolve if a reference exists");
-
-	if (git_path_isfile(ref_path.ptr) == GIT_SUCCESS ||
-		git_hashtable_lookup(repo->references.packfile, ref_path.ptr) != NULL) {
-		*exists = 1;
-	} else {
-		*exists = 0;
-	}
-
-	git_buf_free(&ref_path);
-
-	return GIT_SUCCESS;
-}
-
-static int packed_lookup(git_reference *ref)
-{
-	int error;
-	struct packref *pack_ref = NULL;
-
-	error = packed_load(ref->owner);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error,
-			"Failed to lookup reference from packfile");
-
-	if (ref->flags & GIT_REF_PACKED &&
-		ref->mtime == ref->owner->references.packfile_time)
-		return GIT_SUCCESS;
-
-	if (ref->flags & GIT_REF_SYMBOLIC) {
-		free(ref->target.symbolic);
-		ref->target.symbolic = NULL;
-	}
-
-	/* Look up on the packfile */
-	pack_ref = git_hashtable_lookup(ref->owner->references.packfile, ref->name);
-	if (pack_ref == NULL)
-		return git__throw(GIT_ENOTFOUND,
-			"Failed to lookup reference from packfile");
-
-	ref->flags = GIT_REF_OID | GIT_REF_PACKED;
-	ref->mtime = ref->owner->references.packfile_time;
-	git_oid_cpy(&ref->target.oid, &pack_ref->oid);
-
-	return GIT_SUCCESS;
-}
-
-static int reference_lookup(git_reference *ref)
-{
-	int error_loose, error_packed;
-
-	error_loose = loose_lookup(ref);
-	if (error_loose == GIT_SUCCESS)
-		return GIT_SUCCESS;
-
-	error_packed = packed_lookup(ref);
-	if (error_packed == GIT_SUCCESS)
-		return GIT_SUCCESS;
-
-	git_reference_free(ref);
-
-	if (error_loose != GIT_ENOTFOUND)
-		return git__rethrow(error_loose, "Failed to lookup reference");
-
-	if (error_packed != GIT_ENOTFOUND)
-		return git__rethrow(error_packed, "Failed to lookup reference");
-
-	return git__throw(GIT_ENOTFOUND, "Reference not found");
-}
-
-/*
- * Delete a reference.
- * This is an internal method; the reference is removed
- * from disk or the packfile, but the pointer is not freed
- */
-static int reference_delete(git_reference *ref)
-{
-	int error;
-
-	assert(ref);
-
-	/* If the reference is packed, this is an expensive operation.
-	 * We need to reload the packfile, remove the reference from the
-	 * packing list, and repack */
-	if (ref->flags & GIT_REF_PACKED) {
-		struct packref *packref;
-		/* load the existing packfile */
-		if ((error = packed_load(ref->owner)) < GIT_SUCCESS)
-			return git__rethrow(error, "Failed to delete reference");
-
-		if (git_hashtable_remove2(ref->owner->references.packfile,
-				ref->name, (void **) &packref) < GIT_SUCCESS)
-			return git__throw(GIT_ENOTFOUND, "Reference not found");
-
-		git__free (packref);
-		error = packed_write(ref->owner);
-
-	/* If the reference is loose, we can just remove the reference
-	 * from the filesystem */
-	} else {
-		git_reference *ref_in_pack;
-		git_buf full_path = GIT_BUF_INIT;
-
-		error = git_buf_joinpath(&full_path, ref->owner->path_repository, ref->name);
-		if (error < GIT_SUCCESS)
-			goto cleanup;
-
-		error = p_unlink(full_path.ptr);
-		git_buf_free(&full_path); /* done with path at this point */
-		if (error < GIT_SUCCESS)
-			goto cleanup;
-
-		/* When deleting a loose reference, we have to ensure that an older
-		 * packed version of it doesn't exist */
-		if (git_reference_lookup(&ref_in_pack, ref->owner,
-				ref->name) == GIT_SUCCESS) {
-			assert((ref_in_pack->flags & GIT_REF_PACKED) != 0);
-			error = git_reference_delete(ref_in_pack);
-		}
-	}
-
-cleanup:
-	return error == GIT_SUCCESS ?
-		GIT_SUCCESS :
-		git__rethrow(error, "Failed to delete reference");
-}
-
 int git_reference_delete(git_reference *ref)
 {
-	int error = reference_delete(ref);
-	if (error < GIT_SUCCESS)
-		return error;
+	const git_oid *old_id = NULL;
+	const char *old_target = NULL;
 
-	git_reference_free(ref);
-	return GIT_SUCCESS;
+	if (ref->type == GIT_REF_OID)
+		old_id = &ref->target.oid;
+	else
+		old_target = ref->target.symbolic;
+
+	return git_refdb_delete(ref->db, ref->name, old_id, old_target);
 }
 
+int git_reference_remove(git_repository *repo, const char *name)
+{
+	git_refdb *db;
+	int error;
+
+	if ((error = git_repository_refdb__weakptr(&db, repo)) < 0)
+		return error;
+
+	return git_refdb_delete(db, name, NULL, NULL);
+}
 
 int git_reference_lookup(git_reference **ref_out,
 	git_repository *repo, const char *name)
 {
+	return git_reference_lookup_resolved(ref_out, repo, name, 0);
+}
+
+int git_reference_name_to_id(
+	git_oid *out, git_repository *repo, const char *name)
+{
 	int error;
-	char normalized_name[GIT_REFNAME_MAX];
+	git_reference *ref;
+
+	if ((error = git_reference_lookup_resolved(&ref, repo, name, -1)) < 0)
+		return error;
+
+	git_oid_cpy(out, git_reference_target(ref));
+	git_reference_free(ref);
+	return 0;
+}
+
+static int reference_normalize_for_repo(
+	git_refname_t out,
+	git_repository *repo,
+	const char *name)
+{
+	int precompose;
+	unsigned int flags = GIT_REF_FORMAT_ALLOW_ONELEVEL;
+
+	if (!git_repository__cvar(&precompose, repo, GIT_CVAR_PRECOMPOSE) &&
+		precompose)
+		flags |= GIT_REF_FORMAT__PRECOMPOSE_UNICODE;
+
+	return git_reference_normalize_name(out, GIT_REFNAME_MAX, name, flags);
+}
+
+int git_reference_lookup_resolved(
+	git_reference **ref_out,
+	git_repository *repo,
+	const char *name,
+	int max_nesting)
+{
+	git_refname_t scan_name;
+	git_ref_t scan_type;
+	int error = 0, nesting;
 	git_reference *ref = NULL;
+	git_refdb *refdb;
 
 	assert(ref_out && repo && name);
 
 	*ref_out = NULL;
 
-	error = normalize_name(normalized_name, sizeof(normalized_name), name, 0);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to lookup reference");
+	if (max_nesting > MAX_NESTING_LEVEL)
+		max_nesting = MAX_NESTING_LEVEL;
+	else if (max_nesting < 0)
+		max_nesting = DEFAULT_NESTING_LEVEL;
 
-	error = reference_alloc(&ref, repo, normalized_name);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to lookup reference");
+	scan_type = GIT_REF_SYMBOLIC;
 
-	error = reference_lookup(ref);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to lookup reference");
+	if ((error = reference_normalize_for_repo(scan_name, repo, name)) < 0)
+		return error;
+
+	if ((error = git_repository_refdb__weakptr(&refdb, repo)) < 0)
+		return error;
+
+	for (nesting = max_nesting;
+		 nesting >= 0 && scan_type == GIT_REF_SYMBOLIC;
+		 nesting--)
+	{
+		if (nesting != max_nesting) {
+			strncpy(scan_name, ref->target.symbolic, sizeof(scan_name));
+			git_reference_free(ref);
+		}
+
+		if ((error = git_refdb_lookup(&ref, refdb, scan_name)) < 0)
+			return error;
+
+		scan_type = ref->type;
+	}
+
+	if (scan_type != GIT_REF_OID && max_nesting != 0) {
+		giterr_set(GITERR_REFERENCE,
+			"Cannot resolve reference (>%u levels deep)", max_nesting);
+		git_reference_free(ref);
+		return -1;
+	}
 
 	*ref_out = ref;
-	return GIT_SUCCESS;
+	return 0;
+}
+
+int git_reference_dwim(git_reference **out, git_repository *repo, const char *refname)
+{
+	int error = 0, i;
+	bool fallbackmode = true, foundvalid = false;
+	git_reference *ref;
+	git_buf refnamebuf = GIT_BUF_INIT, name = GIT_BUF_INIT;
+
+	static const char* formatters[] = {
+		"%s",
+		GIT_REFS_DIR "%s",
+		GIT_REFS_TAGS_DIR "%s",
+		GIT_REFS_HEADS_DIR "%s",
+		GIT_REFS_REMOTES_DIR "%s",
+		GIT_REFS_REMOTES_DIR "%s/" GIT_HEAD_FILE,
+		NULL
+	};
+
+	if (*refname)
+		git_buf_puts(&name, refname);
+	else {
+		git_buf_puts(&name, GIT_HEAD_FILE);
+		fallbackmode = false;
+	}
+
+	for (i = 0; formatters[i] && (fallbackmode || i == 0); i++) {
+
+		git_buf_clear(&refnamebuf);
+
+		if ((error = git_buf_printf(&refnamebuf, formatters[i], git_buf_cstr(&name))) < 0)
+			goto cleanup;
+
+		if (!git_reference_is_valid_name(git_buf_cstr(&refnamebuf))) {
+			error = GIT_EINVALIDSPEC;
+			continue;
+		}
+		foundvalid = true;
+
+		error = git_reference_lookup_resolved(&ref, repo, git_buf_cstr(&refnamebuf), -1);
+
+		if (!error) {
+			*out = ref;
+			error = 0;
+			goto cleanup;
+		}
+
+		if (error != GIT_ENOTFOUND)
+			goto cleanup;
+	}
+
+cleanup:
+	if (error && !foundvalid) {
+		/* never found a valid reference name */
+		giterr_set(GITERR_REFERENCE,
+			"Could not use '%s' as valid reference name", git_buf_cstr(&name));
+	}
+
+	git_buf_free(&name);
+	git_buf_free(&refnamebuf);
+	return error;
 }
 
 /**
  * Getters
  */
-git_rtype git_reference_type(git_reference *ref)
+git_ref_t git_reference_type(const git_reference *ref)
 {
 	assert(ref);
-
-	if (ref->flags & GIT_REF_OID)
-		return GIT_REF_OID;
-
-	if (ref->flags & GIT_REF_SYMBOLIC)
-		return GIT_REF_SYMBOLIC;
-
-	return GIT_REF_INVALID;
+	return ref->type;
 }
 
-int git_reference_is_packed(git_reference *ref)
-{
-	assert(ref);
-	return !!(ref->flags & GIT_REF_PACKED);
-}
-
-const char *git_reference_name(git_reference *ref)
+const char *git_reference_name(const git_reference *ref)
 {
 	assert(ref);
 	return ref->name;
 }
 
-git_repository *git_reference_owner(git_reference *ref)
+git_repository *git_reference_owner(const git_reference *ref)
 {
 	assert(ref);
-	return ref->owner;
+	return ref->db->repo;
 }
 
-const git_oid *git_reference_oid(git_reference *ref)
+const git_oid *git_reference_target(const git_reference *ref)
 {
 	assert(ref);
 
-	if ((ref->flags & GIT_REF_OID) == 0)
+	if (ref->type != GIT_REF_OID)
 		return NULL;
 
 	return &ref->target.oid;
 }
 
-const char *git_reference_target(git_reference *ref)
+const git_oid *git_reference_target_peel(const git_reference *ref)
 {
 	assert(ref);
 
-	if ((ref->flags & GIT_REF_SYMBOLIC) == 0)
+	if (ref->type != GIT_REF_OID || git_oid_iszero(&ref->peel))
+		return NULL;
+
+	return &ref->peel;
+}
+
+const char *git_reference_symbolic_target(const git_reference *ref)
+{
+	assert(ref);
+
+	if (ref->type != GIT_REF_SYMBOLIC)
 		return NULL;
 
 	return ref->target.symbolic;
 }
 
-int git_reference_create_symbolic(
+static int reference__create(
 	git_reference **ref_out,
 	git_repository *repo,
 	const char *name,
-	const char *target,
-	int force)
+	const git_oid *oid,
+	const char *symbolic,
+	int force,
+	const git_signature *signature,
+	const char *log_message,
+	const git_oid *old_id,
+	const char *old_target)
 {
-	char normalized[GIT_REFNAME_MAX];
-	int ref_exists, error = GIT_SUCCESS;
+	git_refname_t normalized;
+	git_refdb *refdb;
 	git_reference *ref = NULL;
+	int error = 0;
 
-	error = normalize_name(normalized, sizeof(normalized), name, 0);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
+	assert(repo && name);
+	assert(symbolic || signature);
 
-	if ((error = reference_exists(&ref_exists, repo, normalized) < GIT_SUCCESS))
-		return git__rethrow(error, "Failed to create symbolic reference");
+	if (ref_out)
+		*ref_out = NULL;
 
-	if (ref_exists && !force)
-		return git__throw(GIT_EEXISTS,
-			"Failed to create symbolic reference. Reference already exists");
+	error = reference_normalize_for_repo(normalized, repo, name);
+	if (error < 0)
+		return error;
 
-	error = reference_alloc(&ref, repo, normalized);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
+	error = git_repository_refdb__weakptr(&refdb, repo);
+	if (error < 0)
+		return error;
 
-	ref->flags |= GIT_REF_SYMBOLIC;
+	if (oid != NULL) {
+		git_odb *odb;
 
-	/* set the target; this will normalize the name automatically
-	 * and write the reference on disk */
-	error = git_reference_set_target(ref, target);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
+		assert(symbolic == NULL);
 
-	if (ref_out == NULL) {
-		git_reference_free(ref);
+		/* Sanity check the reference being created - target must exist. */
+		if ((error = git_repository_odb__weakptr(&odb, repo)) < 0)
+			return error;
+
+		if (!git_odb_exists(odb, oid)) {
+			giterr_set(GITERR_REFERENCE,
+				"Target OID for the reference doesn't exist on the repository");
+			return -1;
+		}
+
+		ref = git_reference__alloc(normalized, oid, NULL);
 	} else {
-		*ref_out = ref;
+		git_refname_t normalized_target;
+
+		if ((error = reference_normalize_for_repo(normalized_target, repo, symbolic)) < 0)
+			return error;
+
+		ref = git_reference__alloc_symbolic(normalized, normalized_target);
 	}
 
-	return GIT_SUCCESS;
+	GITERR_CHECK_ALLOC(ref);
 
-cleanup:
-	git_reference_free(ref);
-	return git__rethrow(error, "Failed to create symbolic reference");
+	if ((error = git_refdb_write(refdb, ref, force, signature, log_message, old_id, old_target)) < 0) {
+		git_reference_free(ref);
+		return error;
+	}
+
+	if (ref_out == NULL)
+		git_reference_free(ref);
+	else
+		*ref_out = ref;
+
+	return 0;
 }
 
-int git_reference_create_oid(
+static int log_signature(git_signature **out, git_repository *repo)
+{
+	int error;
+	git_signature *who;
+
+	if(((error = git_signature_default(&who, repo)) < 0) &&
+	   ((error = git_signature_now(&who, "unknown", "unknown")) < 0))
+		return error;
+
+	*out = who;
+	return 0;
+}
+
+int git_reference_create_matching(
 	git_reference **ref_out,
 	git_repository *repo,
 	const char *name,
 	const git_oid *id,
-	int force)
-{
-	int error = GIT_SUCCESS, ref_exists;
-	git_reference *ref = NULL;
-	char normalized[GIT_REFNAME_MAX];
+	int force,
+	const git_oid *old_id,
+	const git_signature *signature,
+	const char *log_message)
 
-	error = normalize_name(normalized, sizeof(normalized), name, 1);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	if ((error = reference_exists(&ref_exists, repo, normalized) < GIT_SUCCESS))
-		return git__rethrow(error, "Failed to create OID reference");
-
-	if (ref_exists && !force)
-		return git__throw(GIT_EEXISTS,
-			"Failed to create OID reference. Reference already exists");
-
-	if ((error = reference_available(repo, name, NULL)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to create reference");
-
-	error = reference_alloc(&ref, repo, name);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	ref->flags |= GIT_REF_OID;
-
-	/* set the oid; this will write the reference on disk */
-	error = git_reference_set_oid(ref, id);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	if (ref_out == NULL) {
-		git_reference_free(ref);
-	} else {
-		*ref_out = ref;
-	}
-
-	return GIT_SUCCESS;
-
-cleanup:
-	git_reference_free(ref);
-	return git__rethrow(error, "Failed to create reference OID");
-}
-
-/*
- * Change the OID target of a reference.
- *
- * For both loose and packed references, just change
- * the oid in memory and (over)write the file in disk.
- *
- * We do not repack packed references because of performance
- * reasons.
- */
-int git_reference_set_oid(git_reference *ref, const git_oid *id)
-{
-	int error = GIT_SUCCESS, exists;
-	git_odb *odb = NULL;
-
-	if ((ref->flags & GIT_REF_OID) == 0)
-		return git__throw(GIT_EINVALIDREFSTATE,
-			"Failed to set OID target of reference. Not an OID reference");
-
-	assert(ref->owner);
-
-	error = git_repository_odb__weakptr(&odb, ref->owner);
-	if (error < GIT_SUCCESS)
-		return error;
-
-	exists = git_odb_exists(odb, id);
-
-	git_odb_free(odb);
-
-	/* Don't let the user create references to OIDs that
-	 * don't exist in the ODB */
-	if (!exists)
-		return git__throw(GIT_ENOTFOUND,
-			"Failed to set OID target of reference. OID doesn't exist in ODB");
-
-	/* Update the OID value on `ref` */
-	git_oid_cpy(&ref->target.oid, id);
-
-	/* Write back to disk */
-	error = loose_write(ref);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to set OID target of reference");
-
-	return GIT_SUCCESS;
-}
-
-/*
- * Change the target of a symbolic reference.
- *
- * This is easy because symrefs cannot be inside
- * a pack. We just change the target in memory
- * and overwrite the file on disk.
- */
-int git_reference_set_target(git_reference *ref, const char *target)
 {
 	int error;
-	char normalized[GIT_REFNAME_MAX];
+	git_signature *who = NULL;
+	
+	assert(id);
 
-	if ((ref->flags & GIT_REF_SYMBOLIC) == 0)
-		return git__throw(GIT_EINVALIDREFSTATE,
-			"Failed to set reference target. Not a symbolic reference");
+	if (!signature) {
+		if ((error = log_signature(&who, repo)) < 0)
+			return error;
+		else
+			signature = who;
+	}
 
-	error = normalize_name(normalized, sizeof(normalized), target, 0);
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error,
-			"Failed to set reference target. Invalid target name");
+	error = reference__create(
+		ref_out, repo, name, id, NULL, force, signature, log_message, old_id, NULL);
 
-	git__free(ref->target.symbolic);
-	ref->target.symbolic = git__strdup(normalized);
-	if (ref->target.symbolic == NULL)
-		return GIT_ENOMEM;
-
-	return loose_write(ref);
+	git_signature_free(who);
+	return error;
 }
 
-int git_reference_rename(git_reference *ref, const char *new_name, int force)
+int git_reference_create(
+	git_reference **ref_out,
+	git_repository *repo,
+	const char *name,
+	const git_oid *id,
+	int force,
+	const git_signature *signature,
+	const char *log_message)
+{
+        return git_reference_create_matching(ref_out, repo, name, id, force, NULL, signature, log_message);
+}
+
+int git_reference_symbolic_create_matching(
+	git_reference **ref_out,
+	git_repository *repo,
+	const char *name,
+	const char *target,
+	int force,
+	const char *old_target,
+	const git_signature *signature,
+	const char *log_message)
 {
 	int error;
-	git_buf aux_path = GIT_BUF_INIT;
-	char normalized[GIT_REFNAME_MAX];
+	git_signature *who = NULL;
 
-	const char *head_target = NULL;
-	git_reference *existing_ref = NULL, *head = NULL;
+	assert(target);
 
-	error = normalize_name(normalized, sizeof(normalized),
-		new_name, ref->flags & GIT_REF_OID);
-
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to rename reference. Invalid name");
-
-	new_name = normalized;
-
-	/* If we are forcing the rename, try to lookup a reference with the
-	 * new one. If the lookup succeeds, we need to delete that ref
-	 * before the renaming can proceed */
-	if (force) {
-		error = git_reference_lookup(&existing_ref, ref->owner, new_name);
-
-		if (error == GIT_SUCCESS) {
-			error = git_reference_delete(existing_ref);
-			if (error < GIT_SUCCESS)
-				return git__rethrow(error,
-					"Failed to rename reference. "
-					"The existing reference cannot be deleted");
-		} else if (error != GIT_ENOTFOUND)
-			goto cleanup;
-
-	/* If we're not forcing the rename, check if the reference exists.
-	 * If it does, renaming cannot continue */
-	} else {
-		int exists;
-
-		error = reference_exists(&exists, ref->owner, normalized);
-		if (error < GIT_SUCCESS)
-			goto cleanup;
-
-		if (exists)
-			return git__throw(GIT_EEXISTS,
-				"Failed to rename reference. Reference already exists");
+	if (!signature) {
+		if ((error = log_signature(&who, repo)) < 0)
+			return error;
+		else
+			signature = who;
 	}
 
-	if ((error = reference_available(ref->owner, new_name, ref->name)) < GIT_SUCCESS)
-		return git__rethrow(error,
-			"Failed to rename reference. Reference already exists");
+	error = reference__create(
+		ref_out, repo, name, NULL, target, force, signature, log_message, NULL, old_target);
 
-	/* Initialize path now so we won't get an allocation failure once
-	 * we actually start removing things.
-	 */
-	error = git_buf_joinpath(&aux_path, ref->owner->path_repository, new_name);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	/*
-	 * Now delete the old ref and remove an possibly existing directory
-	 * named `new_name`. Note that using the internal `reference_delete`
-	 * method deletes the ref from disk but doesn't free the pointer, so
-	 * we can still access the ref's attributes for creating the new one
-	 */
-	if ((error = reference_delete(ref)) < GIT_SUCCESS)
-		goto cleanup;
-
-	if (git_path_exists(aux_path.ptr) == GIT_SUCCESS) {
-		if (git_path_isdir(aux_path.ptr) == GIT_SUCCESS) {
-			if ((error = git_futils_rmdir_r(aux_path.ptr, 0)) < GIT_SUCCESS)
-				goto rollback;
-		} else goto rollback;
-	}
-
-	/*
-	 * Finally we can create the new reference.
-	 */
-	if (ref->flags & GIT_REF_SYMBOLIC) {
-		error = git_reference_create_symbolic(
-			NULL, ref->owner, new_name, ref->target.symbolic, 0);
-	} else {
-		error = git_reference_create_oid(
-			NULL, ref->owner, new_name, &ref->target.oid, 0);
-	}
-
-	if (error < GIT_SUCCESS)
-		goto rollback;
-
-	/*
-	 * Check if we have to update HEAD.
-	 */
-	error = git_reference_lookup(&head, ref->owner, GIT_HEAD_FILE);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	head_target = git_reference_target(head);
-
-	if (head_target && !strcmp(head_target, ref->name)) {
-		error = git_reference_create_symbolic(
-			&head, ref->owner, "HEAD", new_name, 1);
-
-		if (error < GIT_SUCCESS)
-			goto cleanup;
-	}
-
-	/*
-	 * Rename the reflog file.
-	 */
-	error = git_buf_join_n(&aux_path, '/', 3, ref->owner->path_repository,
-						   GIT_REFLOG_DIR, ref->name);
-	if (error < GIT_SUCCESS)
-		goto cleanup;
-
-	if (git_path_exists(aux_path.ptr) == GIT_SUCCESS)
-		error = git_reflog_rename(ref, new_name);
-
-	/*
-	 * Change the name of the reference given by the user.
-	 */
-	git__free(ref->name);
-	ref->name = git__strdup(new_name);
-
-	/* The reference is no longer packed */
-	ref->flags &= ~GIT_REF_PACKED;
-
-cleanup:
-	/* We no longer need the newly created reference nor the head */
-	git_reference_free(head);
-	git_buf_free(&aux_path);
-	return error == GIT_SUCCESS ?
-		GIT_SUCCESS :
-		git__rethrow(error, "Failed to rename reference");
-
-rollback:
-	/*
-	 * Try to create the old reference again.
-	 */
-	if (ref->flags & GIT_REF_SYMBOLIC)
-		error = git_reference_create_symbolic(
-			NULL, ref->owner, ref->name, ref->target.symbolic, 0);
-	else
-		error = git_reference_create_oid(
-			NULL, ref->owner, ref->name, &ref->target.oid, 0);
-
-	/* The reference is no longer packed */
-	ref->flags &= ~GIT_REF_PACKED;
-
-	git_buf_free(&aux_path);
-
-	return error == GIT_SUCCESS ?
-		git__rethrow(GIT_ERROR, "Failed to rename reference. Did rollback") :
-		git__rethrow(error, "Failed to rename reference. Failed to rollback");
+	git_signature_free(who);
+	return error;
 }
 
-int git_reference_resolve(git_reference **ref_out, git_reference *ref)
+int git_reference_symbolic_create(
+	git_reference **ref_out,
+	git_repository *repo,
+	const char *name,
+	const char *target,
+	int force,
+	const git_signature *signature,
+	const char *log_message)
 {
-	int error, i = 0;
+	return git_reference_symbolic_create_matching(ref_out, repo, name, target, force, NULL, signature, log_message);
+}
+
+static int ensure_is_an_updatable_direct_reference(git_reference *ref)
+{
+	if (ref->type == GIT_REF_OID)
+		return 0;
+
+	giterr_set(GITERR_REFERENCE, "Cannot set OID on symbolic reference");
+	return -1;
+}
+
+int git_reference_set_target(
+	git_reference **out,
+	git_reference *ref,
+	const git_oid *id,
+	const git_signature *signature,
+	const char *log_message)
+{
+	int error;
 	git_repository *repo;
 
-	assert(ref);
+	assert(out && ref && id);
 
-	*ref_out = NULL;
-	repo = ref->owner;
+	repo = ref->db->repo;
 
-	/* If the reference is already resolved, we need to return a
-	 * copy. Instead of duplicating `ref`, we look it up again to
-	 * ensure the copy is out to date */
-	if (ref->flags & GIT_REF_OID)
-		return git_reference_lookup(ref_out, ref->owner, ref->name);
+	if ((error = ensure_is_an_updatable_direct_reference(ref)) < 0)
+		return error;
 
-	/* Otherwise, keep iterating until the reference is resolved */
-	for (i = 0; i < MAX_NESTING_LEVEL; ++i) {
-		git_reference *new_ref;
-
-		error = git_reference_lookup(&new_ref, repo, ref->target.symbolic);
-		if (error < GIT_SUCCESS)
-			return git__rethrow(error, "Failed to resolve reference");
-
-		/* Free intermediate references, except for the original one
-		 * we've received */
-		if (i > 0)
-			git_reference_free(ref);
-
-		ref = new_ref;
-
-		/* When the reference we've just looked up is an OID, we've
-		 * successfully resolved the symbolic ref */
-		if (ref->flags & GIT_REF_OID) {
-			*ref_out = ref;
-			return GIT_SUCCESS;
-		}
-	}
-
-	return git__throw(GIT_ENOMEM,
-		"Failed to resolve reference. Reference is too nested");
+	return git_reference_create_matching(out, repo, ref->name, id, 1, &ref->target.oid, signature, log_message);
 }
 
-int git_reference_packall(git_repository *repo)
+static int ensure_is_an_updatable_symbolic_reference(git_reference *ref)
+{
+	if (ref->type == GIT_REF_SYMBOLIC)
+		return 0;
+
+	giterr_set(GITERR_REFERENCE, "Cannot set symbolic target on a direct reference");
+	return -1;
+}
+
+int git_reference_symbolic_set_target(
+	git_reference **out,
+	git_reference *ref,
+	const char *target,
+	const git_signature *signature,
+	const char *log_message)
 {
 	int error;
 
-	/* load the existing packfile */
-	if ((error = packed_load(repo)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to pack references");
+	assert(out && ref && target);
 
-	/* update it in-memory with all the loose references */
-	if ((error = packed_loadloose(repo)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to pack references");
+	if ((error = ensure_is_an_updatable_symbolic_reference(ref)) < 0)
+		return error;
 
-	/* write it back to disk */
-	return packed_write(repo);
+	return git_reference_symbolic_create_matching(
+		out, ref->db->repo, ref->name, target, 1, ref->target.symbolic, signature, log_message);
 }
 
-int git_reference_foreach(
-	git_repository *repo,
-	unsigned int list_flags,
-	int (*callback)(const char *, void *),
-	void *payload)
+static int reference__rename(git_reference **out, git_reference *ref, const char *new_name, int force,
+				 const git_signature *signature, const char *message)
 {
-	int error;
-	struct dirent_list_data data;
-	git_buf refs_path = GIT_BUF_INIT;
+	git_refname_t normalized;
+	bool should_head_be_updated = false;
+	int error = 0;
 
-	/* list all the packed references first */
-	if (list_flags & GIT_REF_PACKED) {
-		const char *ref_name;
-		void *GIT_UNUSED(_unused);
+	assert(ref && new_name && signature);
 
-		if ((error = packed_load(repo)) < GIT_SUCCESS)
-			return git__rethrow(error, "Failed to list references");
+	if ((error = reference_normalize_for_repo(
+			normalized, git_reference_owner(ref), new_name)) < 0)
+		return error;
 
-		GIT_HASHTABLE_FOREACH(repo->references.packfile, ref_name, _unused,
-			if ((error = callback(ref_name, payload)) < GIT_SUCCESS)
-				return git__throw(error,
-					"Failed to list references. User callback failed");
-		);
+
+	/* Check if we have to update HEAD. */
+	if ((error = git_branch_is_head(ref)) < 0)
+		return error;
+
+	should_head_be_updated = (error > 0);
+
+	if ((error = git_refdb_rename(out, ref->db, ref->name, normalized, force, signature, message)) < 0)
+		return error;
+
+	/* Update HEAD it was pointing to the reference being renamed */
+	if (should_head_be_updated &&
+		(error = git_repository_set_head(ref->db->repo, normalized, signature, message)) < 0) {
+		giterr_set(GITERR_REFERENCE, "Failed to update HEAD after renaming reference");
+		return error;
 	}
 
-	/* now list the loose references, trying not to
-	 * duplicate the ref names already in the packed-refs file */
+	return 0;
+}
 
-	data.repo_path_len = strlen(repo->path_repository);
-	data.list_flags = list_flags;
-	data.repo = repo;
-	data.callback = callback;
-	data.callback_payload = payload;
 
-	if ((error = git_buf_joinpath(&refs_path,
-		repo->path_repository, GIT_REFS_DIR)) < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to alloc space for references");
+int git_reference_rename(
+	git_reference **out,
+	git_reference *ref,
+	const char *new_name,
+	int force,
+	const git_signature *signature,
+	const char *log_message)
+{
+	git_signature *who = (git_signature*)signature;
+	int error;
 
-	error = git_path_direach(&refs_path, _dirent_loose_listall, &data);
+	/* Should we return an error if there is no default? */
+	if (!who &&
+	    ((error = git_signature_default(&who, ref->db->repo)) < 0) &&
+	    ((error = git_signature_now(&who, "unknown", "unknown")) < 0)) {
+		return error;
+	}
 
-	git_buf_free(&refs_path);
+	error = reference__rename(out, ref, new_name, force, who, log_message);
+
+	if (!signature)
+		git_signature_free(who);
 
 	return error;
 }
 
-static int cb__reflist_add(const char *ref, void *data)
+int git_reference_resolve(git_reference **ref_out, const git_reference *ref)
 {
-	return git_vector_insert((git_vector *)data, git__strdup(ref));
+	switch (git_reference_type(ref)) {
+	case GIT_REF_OID:
+		return git_reference_lookup(ref_out, ref->db->repo, ref->name);
+
+	case GIT_REF_SYMBOLIC:
+		return git_reference_lookup_resolved(ref_out, ref->db->repo, ref->target.symbolic, -1);
+
+	default:
+		giterr_set(GITERR_REFERENCE, "Invalid reference");
+		return -1;
+	}
 }
 
-int git_reference_listall(
-	git_strarray *array,
+int git_reference_foreach(
 	git_repository *repo,
-	unsigned int list_flags)
+	git_reference_foreach_cb callback,
+	void *payload)
 {
+	git_reference_iterator *iter;
+	git_reference *ref;
 	int error;
+
+	if ((error = git_reference_iterator_new(&iter, repo)) < 0)
+		return error;
+
+	while (!(error = git_reference_next(&ref, iter))) {
+		if ((error = callback(ref, payload)) != 0) {
+			giterr_set_after_callback(error);
+			break;
+		}
+	}
+
+	if (error == GIT_ITEROVER)
+		error = 0;
+
+	git_reference_iterator_free(iter);
+	return error;
+}
+
+int git_reference_foreach_name(
+	git_repository *repo,
+	git_reference_foreach_name_cb callback,
+	void *payload)
+{
+	git_reference_iterator *iter;
+	const char *refname;
+	int error;
+
+	if ((error = git_reference_iterator_new(&iter, repo)) < 0)
+		return error;
+
+	while (!(error = git_reference_next_name(&refname, iter))) {
+		if ((error = callback(refname, payload)) != 0) {
+			giterr_set_after_callback(error);
+			break;
+		}
+	}
+
+	if (error == GIT_ITEROVER)
+		error = 0;
+
+	git_reference_iterator_free(iter);
+	return error;
+}
+
+int git_reference_foreach_glob(
+	git_repository *repo,
+	const char *glob,
+	git_reference_foreach_name_cb callback,
+	void *payload)
+{
+	git_reference_iterator *iter;
+	const char *refname;
+	int error;
+
+	if ((error = git_reference_iterator_glob_new(&iter, repo, glob)) < 0)
+		return error;
+
+	while (!(error = git_reference_next_name(&refname, iter))) {
+		if ((error = callback(refname, payload)) != 0) {
+			giterr_set_after_callback(error);
+			break;
+		}
+	}
+
+	if (error == GIT_ITEROVER)
+		error = 0;
+
+	git_reference_iterator_free(iter);
+	return error;
+}
+
+int git_reference_iterator_new(git_reference_iterator **out, git_repository *repo)
+{
+	git_refdb *refdb;
+
+	if (git_repository_refdb__weakptr(&refdb, repo) < 0)
+		return -1;
+
+	return git_refdb_iterator(out, refdb, NULL);
+}
+
+int git_reference_iterator_glob_new(
+	git_reference_iterator **out, git_repository *repo, const char *glob)
+{
+	git_refdb *refdb;
+
+	if (git_repository_refdb__weakptr(&refdb, repo) < 0)
+		return -1;
+
+	return git_refdb_iterator(out, refdb, glob);
+}
+
+int git_reference_next(git_reference **out, git_reference_iterator *iter)
+{
+	return git_refdb_iterator_next(out, iter);
+}
+
+int git_reference_next_name(const char **out, git_reference_iterator *iter)
+{
+	return git_refdb_iterator_next_name(out, iter);
+}
+
+void git_reference_iterator_free(git_reference_iterator *iter)
+{
+	if (iter == NULL)
+		return;
+
+	git_refdb_iterator_free(iter);
+}
+
+static int cb__reflist_add(const char *ref, void *data)
+{
+	char *name = git__strdup(ref);
+	GITERR_CHECK_ALLOC(name);
+	return git_vector_insert((git_vector *)data, name);
+}
+
+int git_reference_list(
+	git_strarray *array,
+	git_repository *repo)
+{
 	git_vector ref_list;
 
 	assert(array && repo);
@@ -1563,47 +774,18 @@ int git_reference_listall(
 	array->strings = NULL;
 	array->count = 0;
 
-	if (git_vector_init(&ref_list, 8, NULL) < GIT_SUCCESS)
-		return GIT_ENOMEM;
+	if (git_vector_init(&ref_list, 8, NULL) < 0)
+		return -1;
 
-	error = git_reference_foreach(
-		repo, list_flags, &cb__reflist_add, (void *)&ref_list);
-
-	if (error < GIT_SUCCESS) {
+	if (git_reference_foreach_name(
+			repo, &cb__reflist_add, (void *)&ref_list) < 0) {
 		git_vector_free(&ref_list);
-		return error;
+		return -1;
 	}
 
-	array->strings = (char **)ref_list.contents;
-	array->count = ref_list.length;
-	return GIT_SUCCESS;
-}
+	array->strings = (char **)git_vector_detach(&array->count, NULL, &ref_list);
 
-int git_reference_reload(git_reference *ref)
-{
-	int error = reference_lookup(ref);
-
-	if (error < GIT_SUCCESS)
-		return git__rethrow(error, "Failed to reload reference");
-
-	return GIT_SUCCESS;
-}
-
-
-void git_repository__refcache_free(git_refcache *refs)
-{
-	assert(refs);
-
-	if (refs->packfile) {
-		const void *GIT_UNUSED(_unused);
-		struct packref *reference;
-
-		GIT_HASHTABLE_FOREACH(refs->packfile, _unused, reference,
-			free(reference);
-		);
-
-		git_hashtable_free(refs->packfile);
-	}
+	return 0;
 }
 
 static int is_valid_ref_char(char ch)
@@ -1625,115 +807,440 @@ static int is_valid_ref_char(char ch)
 	}
 }
 
-static int normalize_name(
-	char *buffer_out,
-	size_t out_size,
-	const char *name,
-	int is_oid_ref)
+static int ensure_segment_validity(const char *name)
 {
-	const char *name_end, *buffer_out_start;
-	const char *current;
-	int contains_a_slash = 0;
+	const char *current = name;
+	char prev = '\0';
+	const int lock_len = (int)strlen(GIT_FILELOCK_EXTENSION);
+	int segment_len;
 
-	assert(name && buffer_out);
+	if (*current == '.')
+		return -1; /* Refname starts with "." */
 
-	buffer_out_start = buffer_out;
-	current = name;
-	name_end = name + strlen(name);
+	for (current = name; ; current++) {
+		if (*current == '\0' || *current == '/')
+			break;
 
-	/* Terminating null byte */
-	out_size--;
-
-	/* A refname can not be empty */
-	if (name_end == name)
-		return git__throw(GIT_EINVALIDREFNAME,
-			"Failed to normalize name. Reference name is empty");
-
-	/* A refname can not end with a dot or a slash */
-	if (*(name_end - 1) == '.' || *(name_end - 1) == '/')
-		return git__throw(GIT_EINVALIDREFNAME,
-			"Failed to normalize name. Reference name ends with dot or slash");
-
-	while (current < name_end && out_size) {
 		if (!is_valid_ref_char(*current))
-			return git__throw(GIT_EINVALIDREFNAME,
-				"Failed to normalize name. "
-				"Reference name contains invalid characters");
+			return -1; /* Illegal character in refname */
 
-		if (buffer_out > buffer_out_start) {
-			char prev = *(buffer_out - 1);
+		if (prev == '.' && *current == '.')
+			return -1; /* Refname contains ".." */
 
-			/* A refname can not start with a dot nor contain a double dot */
-			if (*current == '.' && ((prev == '.') || (prev == '/')))
-				return git__throw(GIT_EINVALIDREFNAME,
-					"Failed to normalize name. "
-					"Reference name starts with a dot or contains a double dot");
+		if (prev == '@' && *current == '{')
+			return -1; /* Refname contains "@{" */
 
-			/* '@{' is forbidden within a refname */
-			if (*current == '{' && prev == '@')
-				return git__throw(GIT_EINVALIDREFNAME,
-					"Failed to normalize name. Reference name contains '@{'");
-
-			/* Prevent multiple slashes from being added to the output */
-			if (*current == '/' && prev == '/') {
-				current++;
-				continue;
-			}
-		}
-
-		if (*current == '/')
-			contains_a_slash = 1;
-
-		*buffer_out++ = *current++;
-		out_size--;
+		prev = *current;
 	}
 
-	if (!out_size)
-		return git__throw(GIT_EINVALIDREFNAME, "Reference name is too long");
+	segment_len = (int)(current - name);
 
-	/* Object id refname have to contain at least one slash, except
-	 * for HEAD in a detached state or MERGE_HEAD if we're in the
-	 * middle of a merge */
-	if (is_oid_ref &&
-		!contains_a_slash &&
-		strcmp(name, GIT_HEAD_FILE) != 0 &&
-		strcmp(name, GIT_MERGE_HEAD_FILE) != 0 &&
-		strcmp(name, GIT_FETCH_HEAD_FILE) != 0)
-		return git__throw(GIT_EINVALIDREFNAME,
-			"Failed to normalize name. Reference name contains no slashes");
+	/* A refname component can not end with ".lock" */
+	if (segment_len >= lock_len &&
+		!memcmp(current - lock_len, GIT_FILELOCK_EXTENSION, lock_len))
+			return -1;
 
-	/* A refname can not end with ".lock" */
-	if (!git__suffixcmp(name, GIT_FILELOCK_EXTENSION))
-		return git__throw(GIT_EINVALIDREFNAME,
-			"Failed to normalize name. Reference name ends with '.lock'");
-
-	*buffer_out = '\0';
-
-	/*
-	 * For object id references, name has to start with refs/. Again,
-	 * we need to allow HEAD to be in a detached state.
-	 */
-	if (is_oid_ref && !(git__prefixcmp(buffer_out_start, GIT_REFS_DIR) ||
-		strcmp(buffer_out_start, GIT_HEAD_FILE)))
-		return git__throw(GIT_EINVALIDREFNAME,
-			"Failed to normalize name. "
-			"Reference name does not start with 'refs/'");
-
-	return GIT_SUCCESS;
+	return segment_len;
 }
 
+static bool is_all_caps_and_underscore(const char *name, size_t len)
+{
+	size_t i;
+	char c;
+
+	assert(name && len > 0);
+
+	for (i = 0; i < len; i++)
+	{
+		c = name[i];
+		if ((c < 'A' || c > 'Z') && c != '_')
+			return false;
+	}
+
+	if (*name == '_' || name[len - 1] == '_')
+		return false;
+
+	return true;
+}
+
+/* Inspired from https://github.com/git/git/blob/f06d47e7e0d9db709ee204ed13a8a7486149f494/refs.c#L36-100 */
 int git_reference__normalize_name(
-	char *buffer_out,
-	size_t out_size,
-	const char *name)
+	git_buf *buf,
+	const char *name,
+	unsigned int flags)
 {
-	return normalize_name(buffer_out, out_size, name, 0);
+	char *current;
+	int segment_len, segments_count = 0, error = GIT_EINVALIDSPEC;
+	unsigned int process_flags;
+	bool normalize = (buf != NULL);
+
+#ifdef GIT_USE_ICONV
+	git_path_iconv_t ic = GIT_PATH_ICONV_INIT;
+#endif
+
+	assert(name);
+
+	process_flags = flags;
+	current = (char *)name;
+
+	if (*current == '/')
+		goto cleanup;
+
+	if (normalize)
+		git_buf_clear(buf);
+
+#ifdef GIT_USE_ICONV
+	if ((flags & GIT_REF_FORMAT__PRECOMPOSE_UNICODE) != 0) {
+		size_t namelen = strlen(current);
+		if ((error = git_path_iconv_init_precompose(&ic)) < 0 ||
+			(error = git_path_iconv(&ic, &current, &namelen)) < 0)
+			goto cleanup;
+		error = GIT_EINVALIDSPEC;
+	}
+#endif
+
+	while (true) {
+		segment_len = ensure_segment_validity(current);
+		if (segment_len < 0) {
+			if ((process_flags & GIT_REF_FORMAT_REFSPEC_PATTERN) &&
+					current[0] == '*' &&
+					(current[1] == '\0' || current[1] == '/')) {
+				/* Accept one wildcard as a full refname component. */
+				process_flags &= ~GIT_REF_FORMAT_REFSPEC_PATTERN;
+				segment_len = 1;
+			} else
+				goto cleanup;
+		}
+
+		if (segment_len > 0) {
+			if (normalize) {
+				size_t cur_len = git_buf_len(buf);
+
+				git_buf_joinpath(buf, git_buf_cstr(buf), current);
+				git_buf_truncate(buf,
+					cur_len + segment_len + (segments_count ? 1 : 0));
+
+				if (git_buf_oom(buf)) {
+					error = -1;
+					goto cleanup;
+				}
+			}
+
+			segments_count++;
+		}
+
+		/* No empty segment is allowed when not normalizing */
+		if (segment_len == 0 && !normalize)
+			goto cleanup;
+
+		if (current[segment_len] == '\0')
+			break;
+
+		current += segment_len + 1;
+	}
+
+	/* A refname can not be empty */
+	if (segment_len == 0 && segments_count == 0)
+		goto cleanup;
+
+	/* A refname can not end with "." */
+	if (current[segment_len - 1] == '.')
+		goto cleanup;
+
+	/* A refname can not end with "/" */
+	if (current[segment_len - 1] == '/')
+		goto cleanup;
+
+	if ((segments_count == 1 ) && !(flags & GIT_REF_FORMAT_ALLOW_ONELEVEL))
+		goto cleanup;
+
+	if ((segments_count == 1 ) &&
+	    !(flags & GIT_REF_FORMAT_REFSPEC_SHORTHAND) &&
+		!(is_all_caps_and_underscore(name, (size_t)segment_len) ||
+			((flags & GIT_REF_FORMAT_REFSPEC_PATTERN) && !strcmp("*", name))))
+			goto cleanup;
+
+	if ((segments_count > 1)
+		&& (is_all_caps_and_underscore(name, strchr(name, '/') - name)))
+			goto cleanup;
+
+	error = 0;
+
+cleanup:
+	if (error == GIT_EINVALIDSPEC)
+		giterr_set(
+			GITERR_REFERENCE,
+			"The given reference name '%s' is not valid", name);
+
+	if (error && normalize)
+		git_buf_free(buf);
+
+#ifdef GIT_USE_ICONV
+	git_path_iconv_clear(&ic);
+#endif
+
+	return error;
 }
 
-int git_reference__normalize_name_oid(
+int git_reference_normalize_name(
 	char *buffer_out,
-	size_t out_size,
-	const char *name)
+	size_t buffer_size,
+	const char *name,
+	unsigned int flags)
 {
-	return normalize_name(buffer_out, out_size, name, 1);
+	git_buf buf = GIT_BUF_INIT;
+	int error;
+
+	if ((error = git_reference__normalize_name(&buf, name, flags)) < 0)
+		goto cleanup;
+
+	if (git_buf_len(&buf) > buffer_size - 1) {
+		giterr_set(
+		GITERR_REFERENCE,
+		"The provided buffer is too short to hold the normalization of '%s'", name);
+		error = GIT_EBUFS;
+		goto cleanup;
+	}
+
+	git_buf_copy_cstr(buffer_out, buffer_size, &buf);
+
+	error = 0;
+
+cleanup:
+	git_buf_free(&buf);
+	return error;
+}
+
+#define GIT_REF_TYPEMASK (GIT_REF_OID | GIT_REF_SYMBOLIC)
+
+int git_reference_cmp(
+	const git_reference *ref1,
+	const git_reference *ref2)
+{
+	git_ref_t type1, type2;
+	assert(ref1 && ref2);
+
+	type1 = git_reference_type(ref1);
+	type2 = git_reference_type(ref2);
+
+	/* let's put symbolic refs before OIDs */
+	if (type1 != type2)
+		return (type1 == GIT_REF_SYMBOLIC) ? -1 : 1;
+
+	if (type1 == GIT_REF_SYMBOLIC)
+		return strcmp(ref1->target.symbolic, ref2->target.symbolic);
+
+	return git_oid__cmp(&ref1->target.oid, &ref2->target.oid);
+}
+
+static int reference__update_terminal(
+	git_repository *repo,
+	const char *ref_name,
+	const git_oid *oid,
+	int nesting,
+	const git_signature *signature,
+	const char *log_message)
+{
+	git_reference *ref;
+	int error = 0;
+
+	if (nesting > MAX_NESTING_LEVEL) {
+		giterr_set(GITERR_REFERENCE, "Reference chain too deep (%d)", nesting);
+		return GIT_ENOTFOUND;
+	}
+
+	error = git_reference_lookup(&ref, repo, ref_name);
+
+	/* If we haven't found the reference at all, create a new reference. */
+	if (error == GIT_ENOTFOUND) {
+		giterr_clear();
+		return git_reference_create(NULL, repo, ref_name, oid, 0, signature, log_message);
+	}
+
+	if (error < 0)
+		return error;
+
+	/* If the ref is a symbolic reference, follow its target. */
+	if (git_reference_type(ref) == GIT_REF_SYMBOLIC) {
+		error = reference__update_terminal(repo, git_reference_symbolic_target(ref), oid,
+			nesting+1, signature, log_message);
+		git_reference_free(ref);
+	} else {
+		/* If we're not moving the target, don't recreate the ref */
+		if (0 != git_oid_cmp(git_reference_target(ref), oid))
+			error = git_reference_create(NULL, repo, ref_name, oid, 1, signature, log_message);
+		git_reference_free(ref);
+	}
+
+	return error;
+}
+
+/*
+ * Starting with the reference given by `ref_name`, follows symbolic
+ * references until a direct reference is found and updated the OID
+ * on that direct reference to `oid`.
+ */
+int git_reference__update_terminal(
+	git_repository *repo,
+	const char *ref_name,
+	const git_oid *oid,
+	const git_signature *signature,
+	const char *log_message)
+{
+	return reference__update_terminal(repo, ref_name, oid, 0, signature, log_message);
+}
+
+int git_reference_has_log(git_repository *repo, const char *refname)
+{
+	int error;
+	git_refdb *refdb;
+
+	assert(repo && refname);
+
+	if ((error = git_repository_refdb__weakptr(&refdb, repo)) < 0)
+		return error;
+
+	return git_refdb_has_log(refdb, refname);
+}
+
+int git_reference_ensure_log(git_repository *repo, const char *refname)
+{
+	int error;
+	git_refdb *refdb;
+
+	assert(repo && refname);
+
+	if ((error = git_repository_refdb__weakptr(&refdb, repo)) < 0)
+		return error;
+
+	return git_refdb_ensure_log(refdb, refname);
+}
+
+int git_reference__is_branch(const char *ref_name)
+{
+	return git__prefixcmp(ref_name, GIT_REFS_HEADS_DIR) == 0;
+}
+
+int git_reference_is_branch(const git_reference *ref)
+{
+	assert(ref);
+	return git_reference__is_branch(ref->name);
+}
+
+int git_reference__is_remote(const char *ref_name)
+{
+	return git__prefixcmp(ref_name, GIT_REFS_REMOTES_DIR) == 0;
+}
+
+int git_reference_is_remote(const git_reference *ref)
+{
+	assert(ref);
+	return git_reference__is_remote(ref->name);
+}
+
+int git_reference__is_tag(const char *ref_name)
+{
+	return git__prefixcmp(ref_name, GIT_REFS_TAGS_DIR) == 0;
+}
+
+int git_reference_is_tag(const git_reference *ref)
+{
+	assert(ref);
+	return git_reference__is_tag(ref->name);
+}
+
+int git_reference__is_note(const char *ref_name)
+{
+	return git__prefixcmp(ref_name, GIT_REFS_NOTES_DIR) == 0;
+}
+
+int git_reference_is_note(const git_reference *ref)
+{
+	assert(ref);
+	return git_reference__is_note(ref->name);
+}
+
+static int peel_error(int error, git_reference *ref, const char* msg)
+{
+	giterr_set(
+		GITERR_INVALID,
+		"The reference '%s' cannot be peeled - %s", git_reference_name(ref), msg);
+	return error;
+}
+
+int git_reference_peel(
+	git_object **peeled,
+	git_reference *ref,
+	git_otype target_type)
+{
+	git_reference *resolved = NULL;
+	git_object *target = NULL;
+	int error;
+
+	assert(ref);
+
+	if (ref->type == GIT_REF_OID) {
+		resolved = ref;
+	} else {
+		if ((error = git_reference_resolve(&resolved, ref)) < 0)
+			return peel_error(error, ref, "Cannot resolve reference");
+	}
+
+	if (!git_oid_iszero(&resolved->peel)) {
+		error = git_object_lookup(&target,
+			git_reference_owner(ref), &resolved->peel, GIT_OBJ_ANY);
+	} else {
+		error = git_object_lookup(&target,
+			git_reference_owner(ref), &resolved->target.oid, GIT_OBJ_ANY);
+	}
+
+	if (error < 0) {
+		peel_error(error, ref, "Cannot retrieve reference target");
+		goto cleanup;
+	}
+
+	if (target_type == GIT_OBJ_ANY && git_object_type(target) != GIT_OBJ_TAG)
+		error = git_object_dup(peeled, target);
+	else
+		error = git_object_peel(peeled, target, target_type);
+
+cleanup:
+	git_object_free(target);
+
+	if (resolved != ref)
+		git_reference_free(resolved);
+
+	return error;
+}
+
+int git_reference__is_valid_name(const char *refname, unsigned int flags)
+{
+	if (git_reference__normalize_name(NULL, refname, flags) < 0) {
+		giterr_clear();
+		return false;
+	}
+
+	return true;
+}
+
+int git_reference_is_valid_name(const char *refname)
+{
+	return git_reference__is_valid_name(refname, GIT_REF_FORMAT_ALLOW_ONELEVEL);
+}
+
+const char *git_reference_shorthand(const git_reference *ref)
+{
+	const char *name = ref->name;
+
+	if (!git__prefixcmp(name, GIT_REFS_HEADS_DIR))
+		return name + strlen(GIT_REFS_HEADS_DIR);
+	else if (!git__prefixcmp(name, GIT_REFS_TAGS_DIR))
+		return name + strlen(GIT_REFS_TAGS_DIR);
+	else if (!git__prefixcmp(name, GIT_REFS_REMOTES_DIR))
+		return name + strlen(GIT_REFS_REMOTES_DIR);
+	else if (!git__prefixcmp(name, GIT_REFS_DIR))
+		return name + strlen(GIT_REFS_DIR);
+
+	/* No shorthands are avaiable, so just return the name */
+	return name;
 }

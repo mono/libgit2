@@ -1,43 +1,70 @@
-#include <git2.h>
-#include <stdio.h>
+/*
+ * libgit2 "showindex" example - shows how to extract data from the index
+ *
+ * Written by the libgit2 contributors
+ *
+ * To the extent possible under law, the author(s) have dedicated all copyright
+ * and related and neighboring rights to this software to the public domain
+ * worldwide. This software is distributed without any warranty.
+ *
+ * You should have received a copy of the CC0 Public Domain Dedication along
+ * with this software. If not, see
+ * <http://creativecommons.org/publicdomain/zero/1.0/>.
+ */
+
+#include "common.h"
 
 int main (int argc, char** argv)
 {
-  git_repository *repo;
-  git_index *index;
-  unsigned int i, e, ecount;
-  git_index_entry **entries;
-  git_oid oid;
+	git_index *index;
+	unsigned int i, ecount;
+	char *dir = ".";
+	size_t dirlen;
+	char out[41];
+	out[40] = '\0';
 
-  char out[41];
-  out[40] = '\0';
+	git_threads_init();
 
-  git_repository_open(&repo, "/opt/libgit2-test/.git");
+	if (argc > 2)
+		fatal("usage: showindex [<repo-dir>]", NULL);
+	if (argc > 1)
+		dir = argv[1];
 
-  git_repository_index(&index, repo);
-  git_index_read(index);
+	dirlen = strlen(dir);
+	if (dirlen > 5 && strcmp(dir + dirlen - 5, "index") == 0) {
+		check_lg2(git_index_open(&index, dir), "could not open index", dir);
+	} else {
+		git_repository *repo;
+		check_lg2(git_repository_open_ext(&repo, dir, 0, NULL), "could not open repository", dir);
+		check_lg2(git_repository_index(&index, repo), "could not open repository index", NULL);
+		git_repository_free(repo);
+	}
 
-  ecount = git_index_entrycount(index);
-  for (i = 0; i < ecount; ++i) {
-    git_index_entry *e = git_index_get(index, i);
+	git_index_read(index, 0);
 
-    oid = e->oid;
-    git_oid_fmt(out, &oid);
+	ecount = git_index_entrycount(index);
+	if (!ecount)
+		printf("Empty index\n");
 
-    printf("File Path: %s\n", e->path);
-    printf(" Blob SHA: %s\n", out);
-    printf("File Size: %d\n", (int)e->file_size);
-    printf("   Device: %d\n", (int)e->dev);
-    printf("    Inode: %d\n", (int)e->ino);
-    printf("      UID: %d\n", (int)e->uid);
-    printf("      GID: %d\n", (int)e->gid);
-    printf("    ctime: %d\n", (int)e->ctime.seconds);
-    printf("    mtime: %d\n", (int)e->mtime.seconds);
-    printf("\n");
-  }
+	for (i = 0; i < ecount; ++i) {
+		const git_index_entry *e = git_index_get_byindex(index, i);
 
-  git_index_free(index);
+		git_oid_fmt(out, &e->id);
 
-  git_repository_free(repo);
+		printf("File Path: %s\n", e->path);
+		printf("    Stage: %d\n", git_index_entry_stage(e));
+		printf(" Blob SHA: %s\n", out);
+		printf("File Mode: %07o\n", e->mode);
+		printf("File Size: %d bytes\n", (int)e->file_size);
+		printf("Dev/Inode: %d/%d\n", (int)e->dev, (int)e->ino);
+		printf("  UID/GID: %d/%d\n", (int)e->uid, (int)e->gid);
+		printf("    ctime: %d\n", (int)e->ctime.seconds);
+		printf("    mtime: %d\n", (int)e->mtime.seconds);
+		printf("\n");
+	}
+
+	git_index_free(index);
+	git_threads_shutdown();
+
+	return 0;
 }
-

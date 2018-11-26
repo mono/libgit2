@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -27,8 +27,14 @@ struct git_reflog_entry {
 };
 
 struct git_reflog {
+	git_refdb *db;
 	char *ref_name;
 	git_vector entries;
 };
+
+GIT_INLINE(size_t) reflog_inverse_index(size_t idx, size_t total)
+{
+	return (total - 1) - idx;
+}
 
 #endif /* INCLUDE_reflog_h__ */

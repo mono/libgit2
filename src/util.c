@@ -1,12 +1,11 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
  */
 #include <git2.h>
 #include "common.h"
-#include <stdarg.h>
 #include <stdio.h>
 #include <ctype.h>
 #include "posix.h"
@@ -15,35 +14,50 @@
 # include <Shlwapi.h>
 #endif
 
-void git_libgit2_version(int *major, int *minor, int *rev)
-{
-	*major = LIBGIT2_VER_MAJOR;
-	*minor = LIBGIT2_VER_MINOR;
-	*rev = LIBGIT2_VER_REVISION;
-}
-
 void git_strarray_free(git_strarray *array)
 {
 	size_t i;
+
+	if (array == NULL)
+		return;
+
 	for (i = 0; i < array->count; ++i)
 		git__free(array->strings[i]);
 
 	git__free(array->strings);
+
+	memset(array, 0, sizeof(*array));
 }
 
-int git__fnmatch(const char *pattern, const char *name, int flags)
+int git_strarray_copy(git_strarray *tgt, const git_strarray *src)
 {
-	int ret;
+	size_t i;
 
-	ret = p_fnmatch(pattern, name, flags);
-	switch (ret) {
-	case 0:
-		return GIT_SUCCESS;
-	case FNM_NOMATCH:
-		return GIT_ENOMATCH;
-	default:
-		return git__throw(GIT_EOSERR, "Error trying to match path");
+	assert(tgt && src);
+
+	memset(tgt, 0, sizeof(*tgt));
+
+	if (!src->count)
+		return 0;
+
+	tgt->strings = git__calloc(src->count, sizeof(char *));
+	GITERR_CHECK_ALLOC(tgt->strings);
+
+	for (i = 0; i < src->count; ++i) {
+		if (!src->strings[i])
+			continue;
+
+		tgt->strings[tgt->count] = git__strdup(src->strings[i]);
+		if (!tgt->strings[tgt->count]) {
+			git_strarray_free(tgt);
+			memset(tgt, 0, sizeof(*tgt));
+			return -1;
+		}
+
+		tgt->count++;
 	}
+
+	return 0;
 }
 
 int git__strtol64(int64_t *result, const char *nptr, const char **endptr, int base)
@@ -61,7 +75,7 @@ int git__strtol64(int64_t *result, const char *nptr, const char **endptr, int ba
 	/*
 	 * White space
 	 */
-	while (isspace(*p))
+	while (git__isspace(*p))
 		p++;
 
 	/*
@@ -111,35 +125,99 @@ int git__strtol64(int64_t *result, const char *nptr, const char **endptr, int ba
 	}
 
 Return:
-	if (ndig == 0)
-		return git__throw(GIT_ENOTNUM, "Failed to convert string to long. Not a number");
+	if (ndig == 0) {
+		giterr_set(GITERR_INVALID, "Failed to convert string to long. Not a number");
+		return -1;
+	}
 
 	if (endptr)
 		*endptr = p;
 
-	if (ovfl)
-		return git__throw(GIT_EOVERFLOW, "Failed to convert string to long. Overflow error");
+	if (ovfl) {
+		giterr_set(GITERR_INVALID, "Failed to convert string to long. Overflow error");
+		return -1;
+	}
 
 	*result = neg ? -n : n;
-	return GIT_SUCCESS;
+	return 0;
 }
 
 int git__strtol32(int32_t *result, const char *nptr, const char **endptr, int base)
 {
-	int error = GIT_SUCCESS;
+	int error;
 	int32_t tmp_int;
 	int64_t tmp_long;
 
-	if ((error = git__strtol64(&tmp_long, nptr, endptr, base)) < GIT_SUCCESS)
+	if ((error = git__strtol64(&tmp_long, nptr, endptr, base)) < 0)
 		return error;
 
 	tmp_int = tmp_long & 0xFFFFFFFF;
-	if (tmp_int != tmp_long)
-		return git__throw(GIT_EOVERFLOW, "Failed to convert. '%s' is too large", nptr);
+	if (tmp_int != tmp_long) {
+		giterr_set(GITERR_INVALID, "Failed to convert. '%s' is too large", nptr);
+		return -1;
+	}
 
 	*result = tmp_int;
-	
+
 	return error;
+}
+
+int git__strcmp(const char *a, const char *b)
+{
+	while (*a && *b && *a == *b)
+		++a, ++b;
+	return (int)(*(const unsigned char *)a) - (int)(*(const unsigned char *)b);
+}
+
+int git__strcasecmp(const char *a, const char *b)
+{
+	while (*a && *b && tolower(*a) == tolower(*b))
+		++a, ++b;
+	return (tolower(*a) - tolower(*b));
+}
+
+int git__strcasesort_cmp(const char *a, const char *b)
+{
+	int cmp = 0;
+
+	while (*a && *b) {
+		if (*a != *b) {
+			if (tolower(*a) != tolower(*b))
+				break;
+			/* use case in sort order even if not in equivalence */
+			if (!cmp)
+				cmp = (int)(*(const uint8_t *)a) - (int)(*(const uint8_t *)b);
+		}
+
+		++a, ++b;
+	}
+
+	if (*a || *b)
+		return tolower(*a) - tolower(*b);
+
+	return cmp;
+}
+
+int git__strncmp(const char *a, const char *b, size_t sz)
+{
+	while (sz && *a && *b && *a == *b)
+		--sz, ++a, ++b;
+	if (!sz)
+		return 0;
+	return (int)(*(const unsigned char *)a) - (int)(*(const unsigned char *)b);
+}
+
+int git__strncasecmp(const char *a, const char *b, size_t sz)
+{
+	int al, bl;
+
+	do {
+		al = (unsigned char)tolower(*a);
+		bl = (unsigned char)tolower(*b);
+		++a, ++b;
+	} while (--sz && al && al == bl);
+
+	return al - bl;
 }
 
 void git__strntolower(char *str, size_t len)
@@ -159,12 +237,17 @@ void git__strtolower(char *str)
 int git__prefixcmp(const char *str, const char *prefix)
 {
 	for (;;) {
-		char p = *(prefix++), s;
+		unsigned char p = *(prefix++), s;
 		if (!p)
 			return 0;
 		if ((s = *(str++)) != p)
 			return s - p;
 	}
+}
+
+int git__prefixcmp_icase(const char *str, const char *prefix)
+{
+	return strncasecmp(str, prefix, strlen(prefix));
 }
 
 int git__suffixcmp(const char *str, const char *suffix)
@@ -194,6 +277,24 @@ char *git__strtok(char **end, const char *sep)
 			**end = '\0';
 			++*end;
 		}
+
+		return start;
+	}
+
+	return NULL;
+}
+
+/* Similar to strtok, but does not collapse repeated tokens. */
+char *git__strsep(char **end, const char *sep)
+{
+	char *start = *end, *ptr = *end;
+
+	while (*ptr && !strchr(sep, *ptr))
+		++ptr;
+
+	if (*ptr) {
+		*end = ptr + 1;
+		*ptr = '\0';
 
 		return start;
 	}
@@ -347,6 +448,30 @@ uint32_t git__hash(const void *key, int len, uint32_t seed)
  *
  * Copyright (c) 1990 Regents of the University of California.
  * All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution.
+ * 3. [rescinded 22 July 1999]
+ * 4. Neither the name of the University nor the names of its contributors
+ * may be used to endorse or promote products derived from this software
+ * without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 int git__bsearch(
 	void **array,
@@ -355,35 +480,171 @@ int git__bsearch(
 	int (*compare)(const void *, const void *),
 	size_t *position)
 {
-	int lim, cmp;
+	size_t lim;
+	int cmp = -1;
 	void **part, **base = array;
 
 	for (lim = array_len; lim != 0; lim >>= 1) {
 		part = base + (lim >> 1);
 		cmp = (*compare)(key, *part);
 		if (cmp == 0) {
-			*position = (part - array);
-			return GIT_SUCCESS;
-		} else if (cmp > 0) { /* key > p; take right partition */
+			base = part;
+			break;
+		}
+		if (cmp > 0) { /* key > p; take right partition */
 			base = part + 1;
 			lim--;
 		} /* else take left partition */
 	}
 
-	*position = (base - array);
-	return GIT_ENOTFOUND;
+	if (position)
+		*position = (base - array);
+
+	return (cmp == 0) ? 0 : GIT_ENOTFOUND;
+}
+
+int git__bsearch_r(
+	void **array,
+	size_t array_len,
+	const void *key,
+	int (*compare_r)(const void *, const void *, void *),
+	void *payload,
+	size_t *position)
+{
+	size_t lim;
+	int cmp = -1;
+	void **part, **base = array;
+
+	for (lim = array_len; lim != 0; lim >>= 1) {
+		part = base + (lim >> 1);
+		cmp = (*compare_r)(key, *part, payload);
+		if (cmp == 0) {
+			base = part;
+			break;
+		}
+		if (cmp > 0) { /* key > p; take right partition */
+			base = part + 1;
+			lim--;
+		} /* else take left partition */
+	}
+
+	if (position)
+		*position = (base - array);
+
+	return (cmp == 0) ? 0 : GIT_ENOTFOUND;
 }
 
 /**
  * A strcmp wrapper
- * 
+ *
  * We don't want direct pointers to the CRT on Windows, we may
  * get stdcall conflicts.
  */
 int git__strcmp_cb(const void *a, const void *b)
 {
-	const char *stra = (const char *)a;
-	const char *strb = (const char *)b;
+	return strcmp((const char *)a, (const char *)b);
+}
 
-	return strcmp(stra, strb);
+int git__strcasecmp_cb(const void *a, const void *b)
+{
+	return strcasecmp((const char *)a, (const char *)b);
+}
+
+int git__parse_bool(int *out, const char *value)
+{
+	/* A missing value means true */
+	if (value == NULL ||
+		!strcasecmp(value, "true") ||
+		!strcasecmp(value, "yes") ||
+		!strcasecmp(value, "on")) {
+		*out = 1;
+		return 0;
+	}
+	if (!strcasecmp(value, "false") ||
+		!strcasecmp(value, "no") ||
+		!strcasecmp(value, "off") ||
+		value[0] == '\0') {
+		*out = 0;
+		return 0;
+	}
+
+	return -1;
+}
+
+size_t git__unescape(char *str)
+{
+	char *scan, *pos = str;
+
+	if (!str)
+		return 0;
+
+	for (scan = str; *scan; pos++, scan++) {
+		if (*scan == '\\' && *(scan + 1) != '\0')
+			scan++; /* skip '\' but include next char */
+		if (pos != scan)
+			*pos = *scan;
+	}
+
+	if (pos != scan) {
+		*pos = '\0';
+	}
+
+	return (pos - str);
+}
+
+#if defined(GIT_WIN32) || defined(BSD)
+typedef struct {
+	git__sort_r_cmp cmp;
+	void *payload;
+} git__qsort_r_glue;
+
+static int GIT_STDLIB_CALL git__qsort_r_glue_cmp(
+	void *payload, const void *a, const void *b)
+{
+	git__qsort_r_glue *glue = payload;
+	return glue->cmp(a, b, glue->payload);
+}
+#endif
+
+void git__qsort_r(
+	void *els, size_t nel, size_t elsize, git__sort_r_cmp cmp, void *payload)
+{
+#if defined(__MINGW32__) || defined(AMIGA) || \
+	defined(__OpenBSD__) || defined(__NetBSD__) || \
+	defined(__gnu_hurd__) || defined(__ANDROID_API__) || \
+	defined(__sun) || defined(__CYGWIN__) || \
+	(__GLIBC__ == 2 && __GLIBC_MINOR__ < 8)
+	git__insertsort_r(els, nel, elsize, NULL, cmp, payload);
+#elif defined(GIT_WIN32)
+	git__qsort_r_glue glue = { cmp, payload };
+	qsort_s(els, nel, elsize, git__qsort_r_glue_cmp, &glue);
+#elif defined(BSD)
+	git__qsort_r_glue glue = { cmp, payload };
+	qsort_r(els, nel, elsize, &glue, git__qsort_r_glue_cmp);
+#else
+	qsort_r(els, nel, elsize, cmp, payload);
+#endif
+}
+
+void git__insertsort_r(
+	void *els, size_t nel, size_t elsize, void *swapel,
+	git__sort_r_cmp cmp, void *payload)
+{
+	uint8_t *base = els;
+	uint8_t *end = base + nel * elsize;
+	uint8_t *i, *j;
+	bool freeswap = !swapel;
+
+	if (freeswap)
+		swapel = git__malloc(elsize);
+
+	for (i = base + elsize; i < end; i += elsize)
+		for (j = i; j > base && cmp(j, j - elsize, payload) < 0; j -= elsize) {
+			memcpy(swapel, j, elsize);
+			memcpy(j, j - elsize, elsize);
+			memcpy(j - elsize, swapel, elsize);
+		}
+
+	if (freeswap)
+		git__free(swapel);
 }

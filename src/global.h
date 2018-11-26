@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
@@ -8,17 +8,21 @@
 #define INCLUDE_global_h__
 
 #include "mwindow.h"
+#include "hash.h"
 
 typedef struct {
-	struct {
-		char last[1024];
-	} error;
-
-	git_mwindow_ctl mem_ctl;
+	git_error *last_error;
+	git_error error_t;
 } git_global_st;
 
 git_global_st *git__global_state(void);
 
+extern git_mutex git__mwindow_mutex;
+
 #define GIT_GLOBAL (git__global_state())
+
+typedef void (*git_global_shutdown_fn)(void);
+
+extern void git__on_shutdown(git_global_shutdown_fn callback);
 
 #endif

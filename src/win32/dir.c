@@ -1,115 +1,117 @@
 /*
- * Copyright (C) 2009-2011 the libgit2 contributors
+ * Copyright (C) the libgit2 contributors. All rights reserved.
  *
  * This file is part of libgit2, distributed under the GNU GPL v2 with
  * a Linking Exception. For full terms see the included COPYING file.
  */
 #define GIT__WIN32_NO_WRAP_DIR
-#include "dir.h"
-#include "utf-conv.h"
-#include "git2/windows.h"
-
-static int init_filter(char *filter, size_t n, const char *dir)
-{
-	size_t len = strlen(dir);
-
-	if (len+3 >= n)
-		return 0;
-
-	strcpy(filter, dir);
-	if (len && dir[len-1] != '/')
-		strcat(filter, "/");
-	strcat(filter, "*");
-
-	return 1;
-}
+#include "posix.h"
 
 git__DIR *git__opendir(const char *dir)
 {
-	char filter[4096];
-	wchar_t* filter_w;
-	git__DIR *new;
+	git_win32_path filter_w;
+	git__DIR *new = NULL;
+	size_t dirlen;
 
-	if (!dir || !init_filter(filter, sizeof(filter), dir))
+	if (!dir || !git_win32__findfirstfile_filter(filter_w, dir))
 		return NULL;
 
-	new = git__malloc(sizeof(*new));
+	dirlen = strlen(dir);
+
+	new = git__calloc(sizeof(*new) + dirlen + 1, 1);
 	if (!new)
 		return NULL;
+	memcpy(new->dir, dir, dirlen);
 
-	new->dir = git__malloc(strlen(dir)+1);
-	if (!new->dir) {
-		git__free(new);
-		return NULL;
-	}
-	strcpy(new->dir, dir);
-
-	filter_w = gitwin_to_utf16(filter);
 	new->h = FindFirstFileW(filter_w, &new->f);
-	git__free(filter_w);
 
 	if (new->h == INVALID_HANDLE_VALUE) {
-		git__free(new->dir);
+		giterr_set(GITERR_OS, "Could not open directory '%s'", dir);
 		git__free(new);
 		return NULL;
 	}
-	new->first = 1;
 
+	new->first = 1;
 	return new;
+}
+
+int git__readdir_ext(
+	git__DIR *d,
+	struct git__dirent *entry,
+	struct git__dirent **result,
+	int *is_dir)
+{
+	if (!d || !entry || !result || d->h == INVALID_HANDLE_VALUE)
+		return -1;
+
+	*result = NULL;
+
+	if (d->first)
+		d->first = 0;
+	else if (!FindNextFileW(d->h, &d->f)) {
+		if (GetLastError() == ERROR_NO_MORE_FILES)
+			return 0;
+		giterr_set(GITERR_OS, "Could not read from directory '%s'", d->dir);
+		return -1;
+	}
+
+	/* Convert the path to UTF-8 */
+	if (git_win32_path_to_utf8(entry->d_name, d->f.cFileName) < 0)
+		return -1;
+
+	entry->d_ino = 0;
+
+	*result = entry;
+
+	if (is_dir != NULL)
+		*is_dir = ((d->f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+
+	return 0;
 }
 
 struct git__dirent *git__readdir(git__DIR *d)
 {
-	if (!d || d->h == INVALID_HANDLE_VALUE)
+	struct git__dirent *result;
+	if (git__readdir_ext(d, &d->entry, &result, NULL) < 0)
 		return NULL;
-
-	if (d->first)
-		d->first = 0;
-	else {
-		if (!FindNextFileW(d->h, &d->f))
-			return NULL;
-	}
-
-	if (wcslen(d->f.cFileName) >= sizeof(d->entry.d_name))
-		return NULL;
-
-	d->entry.d_ino = 0;
-	WideCharToMultiByte(gitwin_get_codepage(), 0, d->f.cFileName, -1, d->entry.d_name, GIT_PATH_MAX, NULL, NULL);
-
-	return &d->entry;
+	return result;
 }
 
 void git__rewinddir(git__DIR *d)
 {
-	char filter[4096];
-	wchar_t* filter_w;
+	git_win32_path filter_w;
 
-	if (d) {
-		if (d->h != INVALID_HANDLE_VALUE)
-			FindClose(d->h);
+	if (!d)
+		return;
+
+	if (d->h != INVALID_HANDLE_VALUE) {
+		FindClose(d->h);
 		d->h = INVALID_HANDLE_VALUE;
 		d->first = 0;
-
-		if (init_filter(filter, sizeof(filter), d->dir)) {
-			filter_w = gitwin_to_utf16(filter);
-			d->h = FindFirstFileW(filter_w, &d->f);
-			git__free(filter_w);
-
-			if (d->h != INVALID_HANDLE_VALUE)
-				d->first = 1;
-		}
 	}
+
+	if (!git_win32__findfirstfile_filter(filter_w, d->dir))
+		return;
+
+	d->h = FindFirstFileW(filter_w, &d->f);
+
+	if (d->h == INVALID_HANDLE_VALUE)
+		giterr_set(GITERR_OS, "Could not open directory '%s'", d->dir);
+	else
+		d->first = 1;
 }
 
 int git__closedir(git__DIR *d)
 {
-	if (d) {
-		if (d->h != INVALID_HANDLE_VALUE)
-			FindClose(d->h);
-		if (d->dir)
-			git__free(d->dir);
-		git__free(d);
+	if (!d)
+		return 0;
+
+	if (d->h != INVALID_HANDLE_VALUE) {
+		FindClose(d->h);
+		d->h = INVALID_HANDLE_VALUE;
 	}
+
+	git__free(d);
 	return 0;
 }
 
